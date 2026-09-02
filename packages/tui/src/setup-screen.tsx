@@ -3,10 +3,10 @@
 // nothing outside this component ever needs to read it, unlike the atom-backed state in app.tsx,
 // so there's no reason to route it through an atom.
 import type { ModelOption, ProviderOption, Session } from "@nanocode/agent";
-import { Box, Text } from "ink";
+import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { SelectList } from "./select-list.tsx";
 
 /** packages/cli/src/tui.tsx implements this, closing over the real MutableModels/resolveModel it
@@ -21,6 +21,8 @@ export interface ModelSetupController {
 }
 
 type SetupPhase =
+  | { step: "choose-auth-method" }
+  | { step: "oauth-unavailable" }
   | { step: "loading" }
   | { step: "choose-provider"; providers: ProviderOption[] }
   | { step: "enter-key"; provider: ProviderOption }
@@ -40,22 +42,46 @@ export function SetupScreen({
   setup: ModelSetupController;
   onReady: (session: Session) => void;
 }) {
-  const [phase, setPhase] = useState<SetupPhase>({ step: "loading" });
+  // Starts on the auth-method choice, matching pi's own /login flow (which also asks OAuth vs.
+  // API key first) -- OAuth is listed but not selectable yet (ADR 0004 declined it outright for
+  // nanocode, no path back to reconsidering it here). listProviders() only runs once the user
+  // actually picks "API Key," not eagerly on mount.
+  const [phase, setPhase] = useState<SetupPhase>({ step: "choose-auth-method" });
 
-  useEffect(() => {
-    let cancelled = false;
+  const loadProviders = () => {
+    setPhase({ step: "loading" });
     setup.listProviders().then(
-      (providers) => {
-        if (!cancelled) setPhase({ step: "choose-provider", providers });
-      },
-      (error: unknown) => {
-        if (!cancelled) setPhase({ step: "error", message: describeError(error) });
-      },
+      (providers) => setPhase({ step: "choose-provider", providers }),
+      (error: unknown) => setPhase({ step: "error", message: describeError(error) }),
     );
-    return () => {
-      cancelled = true;
-    };
-  }, [setup]);
+  };
+
+  if (phase.step === "choose-auth-method") {
+    return (
+      <Box flexDirection="column">
+        <Text>How would you like to authenticate?</Text>
+        <SelectList
+          items={[
+            { id: "api-key", label: "API Key" },
+            { id: "oauth", label: "OAuth", sublabel: "not yet available" },
+          ]}
+          onSelect={(id) => {
+            if (id === "oauth") {
+              setPhase({ step: "oauth-unavailable" });
+            } else {
+              loadProviders();
+            }
+          }}
+        />
+      </Box>
+    );
+  }
+
+  if (phase.step === "oauth-unavailable") {
+    return (
+      <OAuthUnavailableNotice onAcknowledge={() => setPhase({ step: "choose-auth-method" })} />
+    );
+  }
 
   if (phase.step === "loading") {
     return <Text color="gray">Loading providers…</Text>;
@@ -150,6 +176,21 @@ export function SetupScreen({
 
   // phase.step === "starting"
   return <Text color="gray">Starting session…</Text>;
+}
+
+function OAuthUnavailableNotice({ onAcknowledge }: { onAcknowledge: () => void }) {
+  useInput(() => {
+    onAcknowledge();
+  });
+  return (
+    <Box flexDirection="column">
+      <Text color="yellow">
+        OAuth isn't supported yet in nanocode -- API keys only
+        (decisions/0004-auth-no-stealth-mode.md).
+      </Text>
+      <Text dimColor>Press any key to go back and choose API Key instead.</Text>
+    </Box>
+  );
 }
 
 function ApiKeyPrompt({

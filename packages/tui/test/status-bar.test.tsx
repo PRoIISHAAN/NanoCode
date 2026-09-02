@@ -15,31 +15,18 @@ const BASE_PROPS = {
 };
 
 describe("StatusBar", () => {
-  it("frames the panel with a horizontal bar above and below, cwd alone on the line right after the top one", () => {
+  // StatusBar itself no longer draws the horizontal rules -- app.tsx's RunningSession frames the
+  // *prompt box* with HorizontalRule (matching pi's layout: rule, prompt, rule, cwd, stats), and
+  // StatusBar is just the cwd + data block that goes below the second rule. That framing is
+  // covered at the App level (packages/tui/test/app.test.tsx), not here.
+  it("shows cwd alone on its own line, with every other data point on the line below it", () => {
     const { lastFrame } = render(<StatusBar {...BASE_PROPS} />);
     const lines = (lastFrame() ?? "").split("\n");
-    // At least two full-width horizontal rules, and the cwd sits alone (no other data) on the
-    // line immediately following the first one -- exactly the "cwd in the upper line" layout.
-    const ruleLines = lines.filter((line) => /^─+$/.test(line));
-    expect(ruleLines.length).toBeGreaterThanOrEqual(2);
-    const firstRuleIndex = lines.indexOf(ruleLines[0]);
-    expect(lines[firstRuleIndex + 1]).toBe("/home/me/project");
-  });
-
-  it("puts every other data point together in the block below cwd, not mixed into the cwd line itself", () => {
-    const { lastFrame } = render(<StatusBar {...BASE_PROPS} />);
-    const lines = (lastFrame() ?? "").split("\n");
-    const cwdIndex = lines.indexOf("/home/me/project");
-    const closingRuleIndex = lines.findIndex((line, i) => i > cwdIndex && /^─+$/.test(line));
-    // Everything between cwd and the closing rule is the data block -- joined back together since
-    // Ink wraps a long Text onto multiple physical lines at typical terminal widths (this data
-    // line, combining tokens/context/cost/model/reasoning/busy, is long enough to do exactly
-    // that); the wrap itself is normal Ink behavior, not something this test should be brittle
-    // against the exact line count of.
-    const dataBlock = lines.slice(cwdIndex + 1, closingRuleIndex).join(" ");
-    expect(dataBlock).toContain("↑1,234");
-    expect(dataBlock).toContain("↓567");
-    expect(dataBlock).toContain("1.0% of 200,000 ctx"); // 2000 / 200000 = 1.0%
+    expect(lines[0]).toBe("/home/me/project");
+    const dataBlock = lines.slice(1).join(" ");
+    expect(dataBlock).toContain("↑1.2K"); // 1234 -> compact "1.2K"
+    expect(dataBlock).toContain("↓567"); // below 1000 -- no "K" suffix
+    expect(dataBlock).toContain("1.0%/200k"); // 2000 / 200000 = 1.0%, 200000 -> "200k"
     expect(dataBlock).toContain("$0.1234");
     expect(dataBlock).toContain("openrouter/anthropic/claude-3-haiku");
     expect(dataBlock).toContain("off");
@@ -57,8 +44,41 @@ describe("StatusBar", () => {
       <StatusBar {...BASE_PROPS} contextTokens={0} contextWindow={0} totalCostUsd={0} />,
     );
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("0.0% of 0 ctx");
+    expect(frame).toContain("0.0%/0");
     expect(frame).not.toContain("NaN");
     expect(frame).not.toContain("Infinity");
+  });
+
+  it("compacts the context window with a 'k' suffix, rounding to one decimal when not a whole thousand", () => {
+    const { lastFrame } = render(<StatusBar {...BASE_PROPS} contextWindow={131_072} />);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/131.1k");
+  });
+
+  it("shows a sub-1000 context window as a plain number, no 'k' suffix", () => {
+    const { lastFrame } = render(
+      <StatusBar {...BASE_PROPS} contextTokens={0} contextWindow={512} />,
+    );
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("/512");
+    expect(frame).not.toContain("/512k");
+  });
+
+  it("compacts sent/received token counts above 999 with an uppercase 'K', leaves smaller counts plain", () => {
+    const { lastFrame } = render(
+      <StatusBar {...BASE_PROPS} totalInputTokens={1000} totalOutputTokens={999} />,
+    );
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("↑1.0K"); // whole-thousand token counts still keep the ".0"
+    expect(frame).toContain("↓999");
+  });
+
+  it("always shows exactly one decimal place for a K-suffixed token count, even a whole thousand", () => {
+    const { lastFrame } = render(
+      <StatusBar {...BASE_PROPS} totalInputTokens={1234} totalOutputTokens={12_000} />,
+    );
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("↑1.2K");
+    expect(frame).toContain("↓12.0K"); // NOT "12K" -- tokens always keep the decimal place
   });
 });

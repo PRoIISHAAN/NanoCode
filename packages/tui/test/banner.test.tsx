@@ -8,9 +8,10 @@ describe("StartupBanner", () => {
     const frame = lastFrame() ?? "";
     expect(frame).toContain("nanocode v0.1.0");
     expect(frame).toContain("ctrl+o toggle tool output");
-    // pi-specific hints that don't apply to nanocode's single-tool design must never appear here.
+    // "! bash" IS a real nanocode feature (the bash-escape convenience) -- unlike the pi-specific
+    // hints below, which describe pi features nanocode doesn't have and must never appear here.
+    expect(frame).toMatch(/! bash/);
     expect(frame).not.toMatch(/\/ commands/);
-    expect(frame).not.toMatch(/! bash/);
     expect(frame).not.toMatch(/ripgrep|fd not found/);
   });
 });

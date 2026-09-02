@@ -34,6 +34,7 @@ import {
   buildRuntimeForModel,
   createModelsContext,
   type NanocodeSetup,
+  runShellCommand,
   tryResolveConfiguredModel,
 } from "./setup.ts";
 import { ensureTrust, TrustDeniedError } from "./trust-prompt.ts";
@@ -98,8 +99,18 @@ async function main(): Promise<void> {
     },
   };
 
+  // Passed straight through -- runShellCommand spawns a real host shell process directly (like
+  // pi's own "!"), independent of any session/kernel, so there's no `runtime` to close over here
+  // at all (an earlier version of this function routed bang commands through the kernel instead
+  // and needed one; see setup.ts's runShellCommand for why that changed).
   const { waitUntilExit } = render(
-    <App session={initialSession} setup={setup} version={PACKAGE_VERSION} cwd={process.cwd()} />,
+    <App
+      session={initialSession}
+      setup={setup}
+      version={PACKAGE_VERSION}
+      cwd={process.cwd()}
+      runShellCommand={runShellCommand}
+    />,
   );
   try {
     await waitUntilExit();

@@ -1,8 +1,8 @@
 // Onboarding (decisions/0011-tui-onboarding.md): drives SetupScreen against a fake
 // ModelSetupController (no real MutableModels/kernel involved -- that bridge is tested for real in
 // packages/agent/test/model-setup.test.ts and packages/ai/test/credential-store.test.ts) to prove
-// the UI's own state machine -- provider choice, conditional key entry, model choice, onReady --
-// wires together correctly.
+// the UI's own state machine -- auth-method choice, provider choice, conditional key entry, model
+// choice, onReady -- wires together correctly.
 import type { Session } from "@nanocode/agent";
 import { render } from "ink-testing-library";
 import { describe, expect, it, vi } from "vitest";
@@ -12,7 +12,58 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const FAKE_SESSION = {} as Session; // opaque to SetupScreen -- it only ever passes this through.
 
+/** Every real flow starts on the auth-method choice; this drives past it by selecting the
+ * already-highlighted "API Key" option (index 0), matching what every test below needs to do
+ * before it can reach the provider/model flow it's actually testing. */
+async function chooseApiKeyAuth(stdin: { write: (data: string) => void }): Promise<void> {
+  await wait(30);
+  stdin.write("\r");
+  await wait(30);
+}
+
 describe("SetupScreen", () => {
+  it("starts on the auth-method choice, listing OAuth as not yet available", async () => {
+    const controller: ModelSetupController = {
+      listProviders: vi.fn(),
+      listModels: () => [],
+      login: vi.fn(),
+      finish: vi.fn(),
+    };
+    const { lastFrame } = render(<SetupScreen setup={controller} onReady={() => {}} />);
+    await wait(30);
+
+    expect(lastFrame()).toContain("How would you like to authenticate?");
+    expect(lastFrame()).toContain("API Key");
+    expect(lastFrame()).toContain("OAuth");
+    expect(lastFrame()).toContain("not yet available");
+    // listProviders() must not run until the user actually picks "API Key".
+    expect(controller.listProviders).not.toHaveBeenCalled();
+  });
+
+  it("shows a notice and returns to the auth-method choice when OAuth is selected", async () => {
+    const controller: ModelSetupController = {
+      listProviders: vi.fn(),
+      listModels: () => [],
+      login: vi.fn(),
+      finish: vi.fn(),
+    };
+    const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
+    await wait(30);
+
+    stdin.write("\x1b[B"); // down arrow -- move off "API Key" onto "OAuth"
+    await wait(30);
+    stdin.write("\r"); // select OAuth
+    await wait(30);
+
+    expect(lastFrame()).toContain("OAuth isn't supported yet");
+    expect(controller.listProviders).not.toHaveBeenCalled();
+
+    stdin.write("x"); // any key acknowledges the notice
+    await wait(30);
+
+    expect(lastFrame()).toContain("How would you like to authenticate?");
+  });
+
   it("shows a provider already configured skipping straight to model choice", async () => {
     const controller: ModelSetupController = {
       listProviders: async () => [
@@ -24,12 +75,12 @@ describe("SetupScreen", () => {
     };
 
     const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     expect(lastFrame()).toContain("Anthropic");
     expect(lastFrame()).toContain("configured");
 
     stdin.write("\r"); // select the (only, already-highlighted) provider
-    await wait(10);
+    await wait(30);
 
     expect(lastFrame()).toContain("Claude Sonnet 5");
     expect(controller.login).not.toHaveBeenCalled();
@@ -46,7 +97,7 @@ describe("SetupScreen", () => {
     };
 
     const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     stdin.write("\r"); // select the only provider
     await wait(10);
     expect(lastFrame()).toContain("Enter your Anthropic API key");
@@ -85,7 +136,7 @@ describe("SetupScreen", () => {
     };
 
     const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     stdin.write("\r"); // select the only provider
     await wait(10);
     for (const ch of "sk-test-key") {
@@ -117,7 +168,7 @@ describe("SetupScreen", () => {
     };
 
     const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     expect(lastFrame()).toContain("ambient credentials only");
 
     stdin.write("\r");
@@ -139,7 +190,7 @@ describe("SetupScreen", () => {
     const onReady = vi.fn();
 
     const { stdin } = render(<SetupScreen setup={controller} onReady={onReady} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     stdin.write("\r"); // provider
     await wait(10);
     stdin.write("\r"); // model
@@ -159,8 +210,8 @@ describe("SetupScreen", () => {
       finish: vi.fn(),
     };
 
-    const { lastFrame } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
+    await chooseApiKeyAuth(stdin);
 
     expect(lastFrame()).toContain("Setup failed");
     expect(lastFrame()).toContain("network unreachable");
@@ -179,7 +230,7 @@ describe("SetupScreen", () => {
     };
 
     const { lastFrame, stdin } = render(<SetupScreen setup={controller} onReady={() => {}} />);
-    await wait(10);
+    await chooseApiKeyAuth(stdin);
     stdin.write("\r");
     await wait(10);
     stdin.write("\r");

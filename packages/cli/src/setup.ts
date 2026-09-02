@@ -4,7 +4,9 @@
 // must never import packages/kernel or packages/ai directly (decisions/0005-tui-stack.md's
 // invariant), so the entrypoint that touches those lives in packages/cli, handing the TUI only an
 // already-constructed `Session`.
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 import {
   attachTelemetry,
   createExporterFromEnv,
@@ -38,6 +40,46 @@ import {
 } from "@nanocode/ai";
 import { ReplKernelManager } from "@nanocode/kernel";
 import { ensureTrust } from "./trust-prompt.ts";
+
+const execFileAsync = promisify(execFile);
+
+export interface ShellCommandResult {
+  output: string;
+  isError: boolean;
+}
+
+/**
+ * Runs `command` as a real shell command directly on the host -- exactly like pi's own "!" escape.
+ * pi has no persistent Python kernel to route through at all (it's a plain TS agent), so its "!"
+ * always spawns a native OS shell process directly; an earlier version of this function routed
+ * through nanocode's own kernel instead, which was an unnecessary detour once the actual target
+ * was "behave like pi," not "behave like IPython's `!`." Runs in the CLI process's own
+ * `process.cwd()` -- genuinely independent of whatever cwd the model's own Python code may
+ * separately `os.chdir()` to inside the kernel; the two are different processes entirely, matching
+ * pi exactly (pi's own "!" has no kernel to share state with either).
+ *
+ * Never throws for a failing *command* -- a nonzero exit just means its stderr (which Node
+ * attaches to the rejection alongside stdout) shows up in `output`, exactly the same as a
+ * successful run's output would. `isError` only reflects the shell itself failing to run the
+ * command at all (vanishingly rare -- `/bin/sh`/`$SHELL` being unavailable, say), not the
+ * command's own exit status.
+ */
+export async function runShellCommand(command: string): Promise<ShellCommandResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync(process.env.SHELL ?? "/bin/sh", ["-c", command]);
+    return { output: stdout + stderr || "(no output)", isError: false };
+  } catch (error) {
+    // A nonzero exit rejects the promise, but node still attaches the real stdout/stderr strings
+    // to the error object -- surface those (a failing command's real output) rather than just its
+    // generic "Command failed with exit code N" message.
+    const failure = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+    if (typeof failure.stdout === "string" || typeof failure.stderr === "string") {
+      const combined = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
+      return { output: combined || failure.message, isError: false };
+    }
+    return { output: failure.message, isError: true };
+  }
+}
 
 /** MCP tools are never separate AgentTool entries (decisions/0009-mcp-client-support.md) -- the
  * system prompt just needs to tell the model the two Python-level ways to reach them, and name
@@ -89,12 +131,18 @@ export function createModelsContext(): { models: MutableModels } {
 
 /**
  * Attempts to resolve a model to start the TUI with, without ever prompting: `NANOCODE_PROVIDER`/
- * `NANOCODE_MODEL` env vars win when both are set (an explicit per-invocation override); otherwise
- * falls back to the provider+model last chosen through onboarding
- * (`ModelSetupController.finish()` persists it via `writeStoredModelSelection`). Without this
- * fallback, a run with no env vars set had no way to know which already-configured provider/model
- * to use and re-triggered onboarding from scratch every time, even with a working credential
- * already saved -- a real bug the user hit directly, not a hypothetical.
+ * `NANOCODE_MODEL` env vars are tried first when both are set (an explicit per-invocation
+ * override); if they don't actually resolve to a usable model (missing, or set but pointing at a
+ * provider/model that isn't configured -- e.g. left over from an earlier `export` in the same
+ * shell, for a provider onboarding was never actually completed for), this falls back to the
+ * provider+model last chosen through onboarding (`ModelSetupController.finish()` persists it via
+ * `writeStoredModelSelection`). A first version of this function only fell back when the env vars
+ * were *missing*, not when they were *set but broken* -- so a stale env var pair could silently
+ * shadow a perfectly good saved onboarding choice forever, re-triggering onboarding on every
+ * launch even though a working configuration already existed on disk. Confirmed live: exporting
+ * `NANOCODE_PROVIDER`/`NANOCODE_MODEL` for a provider with no saved credential, with a *different*,
+ * fully-working provider/model already saved via onboarding, reproduced onboarding firing on every
+ * single launch until this fallback was added.
  *
  * Unlike `resolveModel` itself, this never throws for "nothing configured yet" or "provider has no
  * credential" -- both are now a normal, expected TUI-startup state (the caller shows onboarding
@@ -108,17 +156,28 @@ export async function tryResolveConfiguredModel(
   models: MutableModels,
   storedSelectionFilePath?: string,
 ): Promise<Model<Api> | undefined> {
-  let selection: { provider: string; model: string } | undefined;
+  let envSelection: { provider: string; model: string } | undefined;
   try {
-    selection = readModelSelectionFromEnv();
+    envSelection = readModelSelectionFromEnv();
   } catch (error) {
     if (!(error instanceof ModelConfigurationError)) throw error;
-    selection = await readStoredModelSelection(storedSelectionFilePath);
   }
-  if (!selection) return undefined;
+
+  if (envSelection) {
+    try {
+      return await resolveModel(models, envSelection);
+    } catch (error) {
+      if (!(error instanceof ModelConfigurationError)) throw error;
+      // Env vars were set but didn't actually resolve -- fall through to the stored selection
+      // below rather than giving up immediately.
+    }
+  }
+
+  const storedSelection = await readStoredModelSelection(storedSelectionFilePath);
+  if (!storedSelection) return undefined;
 
   try {
-    return await resolveModel(models, selection);
+    return await resolveModel(models, storedSelection);
   } catch (error) {
     if (error instanceof ModelConfigurationError) return undefined;
     throw error;

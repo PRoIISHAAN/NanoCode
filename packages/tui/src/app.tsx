@@ -26,10 +26,16 @@ import { type Atom, atom, useAtom } from "./atom.ts";
 import { createBackpressureQueue } from "./backpressure.ts";
 import { StartupBanner } from "./banner.tsx";
 import { type ModelSetupController, SetupScreen } from "./setup-screen.tsx";
-import { StatusBar } from "./status-bar.tsx";
+import { HorizontalRule, StatusBar } from "./status-bar.tsx";
 import { Transcript, textOf } from "./transcript.tsx";
 
 export type { ModelSetupController } from "./setup-screen.tsx";
+
+/** Runs a "!command" bash escape -- packages/cli/src/setup.ts implements this by spawning a real
+ * host shell process directly (like pi's own "!"; pi has no persistent kernel to route through at
+ * all), passed in as a plain function so packages/tui never has to import @nanocode/kernel or
+ * @nanocode/ai directly (context-graph.json's tui_isolation invariant). */
+export type RunShellCommand = (command: string) => Promise<{ output: string; isError: boolean }>;
 
 export interface AppProps {
   /** Undefined on an unconfigured launch (decisions/0011-tui-onboarding.md) -- App shows
@@ -41,10 +47,19 @@ export interface AppProps {
   /** The process's working directory, for the status bar -- passed in rather than read via
    * `process.cwd()` here so this component stays trivially testable with an arbitrary value. */
   cwd: string;
+  runShellCommand: RunShellCommand;
 }
 
 interface SessionAtoms {
   messages: Atom<AgentMessage[]>;
+  /** "!command" entries -- a synthetic user message plus a synthetic toolResult, appended here
+   * rather than sent to the model at all. Kept separate from `messages` (not pushed into
+   * `session.state.messages`) rather than merged permanently into session history: a bash escape
+   * is a local terminal convenience, the same as pi's own "!" (or IPython's, which this project's
+   * kernel already inherits the persistent-REPL feel from) -- not something the model said or
+   * needs in its own context. `TranscriptView` merges this with `messages` by timestamp purely for
+   * display. */
+  localEntries: Atom<AgentMessage[]>;
   streamingText: Atom<string | undefined>;
   busy: Atom<boolean>;
   error: Atom<string | undefined>;
@@ -56,6 +71,7 @@ interface SessionAtoms {
 function createSessionAtoms(session: Session): SessionAtoms {
   return {
     messages: atom(session.state.messages.slice()),
+    localEntries: atom<AgentMessage[]>([]),
     streamingText: atom<string | undefined>(undefined),
     busy: atom(false),
     error: atom<string | undefined>(undefined),
@@ -63,7 +79,7 @@ function createSessionAtoms(session: Session): SessionAtoms {
   };
 }
 
-export function App({ session: initialSession, setup, version, cwd }: AppProps) {
+export function App({ session: initialSession, setup, version, cwd, runShellCommand }: AppProps) {
   // Starts undefined on an unconfigured launch; SetupScreen's onReady sets it once setup.finish()
   // hands back a fully-built Session. `useMemo` with an empty dependency array (not a lazy
   // useState initializer) is deliberate here too: App itself is only ever mounted once per process
@@ -77,7 +93,7 @@ export function App({ session: initialSession, setup, version, cwd }: AppProps) 
     <Box flexDirection="column">
       <StartupBanner version={version} />
       {session ? (
-        <RunningSession session={session} cwd={cwd} />
+        <RunningSession session={session} cwd={cwd} runShellCommand={runShellCommand} />
       ) : (
         <SetupScreen setup={setup} onReady={(ready) => sessionAtom.set(ready)} />
       )}
@@ -114,7 +130,15 @@ function sumUsage(messages: readonly AgentMessage[]): UsageSummary {
   return { totalInputTokens, totalOutputTokens, contextTokens, totalCostUsd };
 }
 
-function RunningSession({ session, cwd }: { session: Session; cwd: string }) {
+function RunningSession({
+  session,
+  cwd,
+  runShellCommand,
+}: {
+  session: Session;
+  cwd: string;
+  runShellCommand: RunShellCommand;
+}) {
   // Recreated only when `session` identity changes, via useMemo's dependency array -- not a lazy
   // useState initializer, which React only ever runs once on mount regardless of later prop
   // changes. Fixes a latent bug an L4 review found: if this component were ever reused across
@@ -176,31 +200,54 @@ function RunningSession({ session, cwd }: { session: Session; cwd: string }) {
     <Box flexDirection="column">
       <TranscriptView
         messagesAtom={atoms.messages}
+        localEntriesAtom={atoms.localEntries}
         streamingTextAtom={atoms.streamingText}
         toolOutputExpandedAtom={atoms.toolOutputExpanded}
       />
       <ErrorLine errorAtom={atoms.error} />
+      <HorizontalRule />
+      <PromptInput
+        session={session}
+        busyAtom={atoms.busy}
+        errorAtom={atoms.error}
+        localEntriesAtom={atoms.localEntries}
+        runShellCommand={runShellCommand}
+      />
+      <HorizontalRule />
       <StatusLine session={session} cwd={cwd} messagesAtom={atoms.messages} busyAtom={atoms.busy} />
-      <PromptInput session={session} busyAtom={atoms.busy} errorAtom={atoms.error} />
     </Box>
   );
 }
 
+function messageTimestamp(message: AgentMessage): number {
+  return (message as { timestamp?: number }).timestamp ?? 0;
+}
+
 function TranscriptView({
   messagesAtom,
+  localEntriesAtom,
   streamingTextAtom,
   toolOutputExpandedAtom,
 }: {
   messagesAtom: Atom<AgentMessage[]>;
+  localEntriesAtom: Atom<AgentMessage[]>;
   streamingTextAtom: Atom<string | undefined>;
   toolOutputExpandedAtom: Atom<boolean>;
 }) {
   const messages = useAtom(messagesAtom);
+  const localEntries = useAtom(localEntriesAtom);
   const streamingText = useAtom(streamingTextAtom);
   const toolOutputExpanded = useAtom(toolOutputExpandedAtom);
+  // Merged purely for display, by when each thing actually happened -- real conversation messages
+  // and "!command" entries are never combined into one array anywhere else (session.state.messages
+  // never sees the local ones at all, see SessionAtoms.localEntries's own comment).
+  const merged = useMemo(
+    () => [...messages, ...localEntries].sort((a, b) => messageTimestamp(a) - messageTimestamp(b)),
+    [messages, localEntries],
+  );
   return (
     <Transcript
-      messages={messages}
+      messages={merged}
       streamingText={streamingText}
       toolOutputExpanded={toolOutputExpanded}
     />
@@ -248,14 +295,42 @@ function ErrorLine({ errorAtom }: { errorAtom: Atom<string | undefined> }) {
   return <Text color="red">{error}</Text>;
 }
 
+/** Builds the synthetic {user, toolResult} pair a "!command" produces for display -- shaped
+ * exactly like a real toolCall round-trip (role "toolResult", a toolName) so Transcript's existing
+ * rendering, including summarizeToolResult's ctrl+o collapse/expand, applies to bash output for
+ * free, with zero new UI code. */
+function buildBangCommandEntries(
+  command: string,
+  result: { output: string; isError: boolean },
+): [AgentMessage, AgentMessage] {
+  const userEntry = {
+    role: "user",
+    content: [{ type: "text", text: `!${command}` }],
+    timestamp: Date.now(),
+  } as AgentMessage;
+  const resultEntry = {
+    role: "toolResult",
+    toolCallId: `shell-${Date.now()}`,
+    toolName: "shell",
+    content: [{ type: "text", text: result.output }],
+    isError: result.isError,
+    timestamp: Date.now(),
+  } as AgentMessage;
+  return [userEntry, resultEntry];
+}
+
 function PromptInput({
   session,
   busyAtom,
   errorAtom,
+  localEntriesAtom,
+  runShellCommand,
 }: {
   session: Session;
   busyAtom: Atom<boolean>;
   errorAtom: Atom<string | undefined>;
+  localEntriesAtom: Atom<AgentMessage[]>;
+  runShellCommand: RunShellCommand;
 }) {
   const busy = useAtom(busyAtom);
   // Typed-but-not-yet-submitted text is local to this component on purpose: nothing else in the
@@ -266,6 +341,30 @@ function PromptInput({
     const text = value.trim();
     if (!text || busy) return;
     setInput("");
+
+    // A leading "!" runs the rest of the line as a real host shell command
+    // (packages/cli/src/setup.ts's runShellCommand) -- never reaching the model at all, matching
+    // pi's own "!" bash escape exactly (pi has no persistent kernel to route through either).
+    if (text.startsWith("!")) {
+      const command = text.slice(1).trim();
+      if (!command) return;
+      busyAtom.set(true);
+      errorAtom.set(undefined);
+      runShellCommand(command)
+        .then((result) => {
+          localEntriesAtom.set([
+            ...localEntriesAtom.get(),
+            ...buildBangCommandEntries(command, result),
+          ]);
+          busyAtom.set(false);
+        })
+        .catch((err: unknown) => {
+          busyAtom.set(false);
+          errorAtom.set(err instanceof Error ? err.message : String(err));
+        });
+      return;
+    }
+
     busyAtom.set(true);
     errorAtom.set(undefined);
     session.prompt(text).catch((err: unknown) => {
@@ -313,7 +412,11 @@ function PromptInput({
     <Box>
       <Text color={busy ? "gray" : "green"}>{busy ? "… " : "> "}</Text>
       <Text dimColor={input.length === 0}>
-        {input.length > 0 ? input : busy ? "working…" : "type a prompt, enter to send"}
+        {input.length > 0
+          ? input
+          : busy
+            ? "working…"
+            : "type a prompt (or !command), enter to send"}
       </Text>
     </Box>
   );
