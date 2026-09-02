@@ -1,0 +1,20 @@
+[project]
+name = "nanocode-kernel-runtime"
+version = "0.1.0"
+description = "Persistent CPython REPL kernel for nanocode's ipython/RLM tool, speaking newline-delimited JSON over stdio."
+requires-python = ">=3.11"
+# No hard runtime dependencies for M1: the core REPL loop (this milestone's scope) only needs
+# the standard library. `dill` (namespace snapshot/restore) is listed as an optional group,
+# matching prime-agent-runtime's own pattern, since M1 never exercises that code path -- it's
+# wired up in a later milestone alongside session persistence.
+dependencies = []
+
+[dependency-groups]
+snapshot = ["dill"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nanocode_kernel"]

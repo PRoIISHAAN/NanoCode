@@ -1,0 +1,16 @@
+{
+  "name": "@nanocode/evals",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "evals": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@nanocode/agent": "0.1.0",
+    "@nanocode/ai": "0.1.0",
+    "@nanocode/kernel": "0.1.0"
+  }
+}

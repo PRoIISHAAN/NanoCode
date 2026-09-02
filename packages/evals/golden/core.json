@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "capital-of-france",
+      "prompt": "What's the capital of France? Respond with only the city name, nothing else.",
+      "checks": [
+        { "type": "outputEquals", "value": "Paris" },
+        { "type": "noErrors" }
+      ]
+    },
+    {
+      "id": "arithmetic-via-python",
+      "prompt": "Use Python to compute 17 * 23 and respond with only the resulting number.",
+      "checks": [
+        { "type": "outputContains", "value": "391" },
+        { "type": "noErrors" }
+      ]
+    },
+    {
+      "id": "write-file",
+      "prompt": "Create a file named hello.txt in the current directory containing exactly the text 'hello world' (no trailing newline needed). Once done, respond with only the word 'done'.",
+      "checks": [
+        { "type": "fileExists", "path": "hello.txt" },
+        { "type": "fileContains", "path": "hello.txt", "value": "hello world" },
+        { "type": "noErrors" }
+      ]
+    }
+  ]
+}

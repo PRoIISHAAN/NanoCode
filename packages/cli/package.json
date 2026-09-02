@@ -1,0 +1,22 @@
+{
+  "name": "@nanocode/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "bin": {
+    "nanocode": "./src/index.ts"
+  },
+  "scripts": {
+    "cli": "tsx src/index.ts",
+    "tui": "tsx src/tui.tsx"
+  },
+  "dependencies": {
+    "@nanocode/agent": "0.1.0",
+    "@nanocode/ai": "0.1.0",
+    "@nanocode/kernel": "0.1.0",
+    "@nanocode/tui": "0.1.0",
+    "ink": "7.1.1",
+    "react": "19.2.8"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "paths": {
+      "@nanocode/ai": ["./packages/ai/src/index.ts"],
+      "@nanocode/ai/*": ["./packages/ai/src/*"],
+      "@nanocode/kernel": ["./packages/kernel/src/index.ts"],
+      "@nanocode/kernel/*": ["./packages/kernel/src/*"],
+      "@nanocode/agent": ["./packages/agent/src/index.ts"],
+      "@nanocode/agent/*": ["./packages/agent/src/*"],
+      "@nanocode/tui": ["./packages/tui/src/index.ts"],
+      "@nanocode/tui/*": ["./packages/tui/src/*"]
+    }
+  },
+  "include": ["packages/*/src/**/*", "packages/*/test/**/*"],
+  "exclude": ["**/dist/**", "**/node_modules/**"]
+}

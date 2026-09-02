@@ -1,0 +1,19 @@
+{
+  "name": "@nanocode/tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "dependencies": {
+    "@nanocode/agent": "0.1.0",
+    "ink": "7.1.1",
+    "ink-text-input": "6.0.0",
+    "react": "19.2.8"
+  },
+  "devDependencies": {
+    "@nanocode/ai": "0.1.0",
+    "@types/react": "19.2.0",
+    "ink-testing-library": "4.0.0",
+    "typebox": "1.3.7"
+  }
+}

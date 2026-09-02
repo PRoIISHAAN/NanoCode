@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage/
+*.tsbuildinfo
+.claude
+.genesis
+research
+
+# Python kernel virtualenv (provisioned at runtime, not checked in)
+packages/kernel/python/.venv/
+packages/kernel/python/**/__pycache__/
+*.pyc
+
+# nanocode's own on-disk session/trust state when run from this repo during dev
+.nanocode/
