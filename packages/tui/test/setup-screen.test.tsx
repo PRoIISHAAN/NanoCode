@@ -80,7 +80,12 @@ describe("SetupScreen", () => {
     expect(lastFrame()).toContain("configured");
 
     stdin.write("\r"); // select the (only, already-highlighted) provider
-    await wait(30);
+    // 30ms was already a bump from an earlier flake at 10ms (see this test's git history) -- still
+    // intermittently too tight now that the full suite has grown substantially larger, under
+    // sequential fileParallelism (vitest.config.ts): a synchronous phase transition in
+    // setup-screen.tsx has no real async work to wait on, so this is purely event-loop scheduling
+    // contention from everything else running, not a genuine race in the component itself.
+    await wait(60);
 
     expect(lastFrame()).toContain("Claude Sonnet 5");
     expect(controller.login).not.toHaveBeenCalled();

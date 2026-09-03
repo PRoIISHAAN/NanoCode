@@ -223,3 +223,142 @@ describe("Session with SessionMemoryOptions (M3 wiring)", () => {
     expect(sessionLog.all.filter((e) => e.kind === "compaction").length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe("Session.compact() (agent.ts's public '/compact' entry point)", () => {
+  function userText(text: string, timestamp: number): AgentMessage {
+    return { role: "user", content: text, timestamp } as AgentMessage;
+  }
+
+  it("is a no-op (resolves false, leaves messages untouched) on a session with no `memory` option at all", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: {
+        model: FAKE_MODEL,
+        systemPrompt: "test",
+        messages: [
+          userText("hi", 1),
+          assistantMessage({ content: [{ type: "text", text: "hey" }] }),
+        ],
+      },
+      // no `memory` -- compactionEngine is never constructed.
+    });
+    const before = session.state.messages;
+
+    await expect(session.compact()).resolves.toBe(false);
+
+    expect(session.state.messages).toBe(before); // not even a new array -- genuinely untouched
+  });
+
+  it("is a no-op on a memory-configured session with too little history to safely compact", async () => {
+    const models = {
+      completeSimple: async () => assistantMessage({ content: [{ type: "text", text: "unused" }] }),
+    } as unknown as MutableModels;
+
+    // Default keepRecentTokens (8_000) treats this whole short conversation as "still recent" --
+    // pickCutIndex has no safe boundary to cut before, so there's nothing to compact yet.
+    const messages: AgentMessage[] = [
+      userText("hi", 1),
+      assistantMessage({ content: [{ type: "text", text: "hey there" }] }),
+    ];
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test", messages },
+      memory: { sessionLog, models, getTaskState: () => undefined },
+    });
+    const before = session.state.messages;
+
+    await expect(session.compact()).resolves.toBe(false);
+
+    expect(session.state.messages).toBe(before);
+    expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(0);
+  });
+
+  it("actually compacts and shrinks session.state.messages on a memory-configured session with enough history", async () => {
+    const models = {
+      completeSimple: async () =>
+        assistantMessage({ content: [{ type: "text", text: "SUMMARY of the early turns." }] }),
+    } as unknown as MutableModels;
+
+    // Four messages, two full user/assistant turns -- with keepRecentTokens this small, the safe
+    // cut point lands right before the final assistant message, so there IS something to compact.
+    const messages: AgentMessage[] = [
+      userText("go", 1),
+      assistantMessage({ content: [{ type: "text", text: "step one" }] }),
+      userText("thanks, what's next?", 3),
+      assistantMessage({ content: [{ type: "text", text: "here is the plan" }] }),
+    ];
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test", messages },
+      memory: {
+        sessionLog,
+        models,
+        getTaskState: () => undefined,
+        compaction: { keepRecentTokens: 1 },
+      },
+    });
+
+    const result = await session.compact();
+
+    expect(result).toBe(true);
+    expect(session.state.messages.length).toBeLessThan(messages.length);
+    // The last message survives verbatim; everything before it was folded into a summary.
+    expect(session.state.messages.at(-1)).toEqual(messages.at(-1));
+    const summaryText = JSON.stringify(session.state.messages[0]);
+    expect(summaryText).toContain("SUMMARY of the early turns.");
+    expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(1);
+  });
+
+  // FOUND DURING TEST-WRITING, NOT FIXED (see final report): a second consecutive session.compact()
+  // call does NOT no-op the way it intuitively should once nothing new has happened. Root cause:
+  // `CompactionEngine.compactedThroughCount` is an absolute offset into whatever `messages` array
+  // it was last called with, an invariant that held for the pre-existing automatic `transform()`
+  // path only because `state.messages` there ever grows, never shrinks. `Session.compact()` breaks
+  // that invariant on purpose (it assigns the shorter, compacted array back into `state.messages`),
+  // so the very next call sees `messages.length < compactedThroughCount` and
+  // `dropStaleCacheIfNeeded` -- built to detect an actual `session.reset()` -- can't distinguish
+  // that from "freshly compacted, still has content," and wipes the cache. The following
+  // forceCompact then treats the *summary message itself* as fresh, uncompacted conversation and
+  // re-wraps it in another compaction pass. This test pins today's actual (surprising) behavior
+  // rather than the behavior a caller would reasonably expect, so a fix doesn't silently regress
+  // unnoticed; see the report for the suggested direction (key the cache off message identity/count
+  // relative to the CURRENT array, not an absolute counter from before the last mutation).
+  it("BUG: a second consecutive compact() re-summarizes the just-created summary instead of no-op'ing, because dropStaleCacheIfNeeded can't tell a manual compact's own shrink apart from session.reset()", async () => {
+    const models = {
+      completeSimple: async () =>
+        assistantMessage({ content: [{ type: "text", text: "SUMMARY." }] }),
+    } as unknown as MutableModels;
+
+    const messages: AgentMessage[] = [
+      userText("go", 1),
+      assistantMessage({ content: [{ type: "text", text: "step one" }] }),
+      userText("thanks, what's next?", 3),
+      assistantMessage({ content: [{ type: "text", text: "here is the plan" }] }),
+    ];
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test", messages },
+      memory: {
+        sessionLog,
+        models,
+        getTaskState: () => undefined,
+        compaction: { keepRecentTokens: 1 },
+      },
+    });
+
+    expect(await session.compact()).toBe(true);
+    expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(1);
+
+    // Ideally a no-op: nothing new happened since the first compact(). Instead it compacts AGAIN,
+    // wrapping the previous compaction-summary message in a second one.
+    const second = await session.compact();
+    expect(second).toBe(true); // <-- would be `false` if the cache survived correctly
+    expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(2);
+    const summaryText = JSON.stringify(session.state.messages[0]);
+    // The final assistant message is still preserved, so this doesn't lose real content -- it's
+    // wasted summarization work (and, indefinitely repeated, an ever-thicker layer of nested
+    // "<compaction-summary>" wrappers) rather than data loss.
+    expect(summaryText).toContain("SUMMARY.");
+    expect(session.state.messages.at(-1)).toEqual(messages.at(-1));
+  });
+});

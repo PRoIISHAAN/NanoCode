@@ -6,7 +6,6 @@ const BASE_PROPS = {
   cwd: "/home/me/project",
   modelLabel: "openrouter/anthropic/claude-3-haiku",
   reasoningLevel: "off",
-  busy: false,
   totalInputTokens: 1234,
   totalOutputTokens: 567,
   contextTokens: 2000,
@@ -30,13 +29,6 @@ describe("StatusBar", () => {
     expect(dataBlock).toContain("$0.1234");
     expect(dataBlock).toContain("openrouter/anthropic/claude-3-haiku");
     expect(dataBlock).toContain("off");
-    expect(dataBlock).toContain("idle");
-  });
-
-  it("shows busy instead of idle while a turn is running", () => {
-    const { lastFrame } = render(<StatusBar {...BASE_PROPS} busy={true} />);
-    expect(lastFrame()).toContain("busy");
-    expect(lastFrame()).not.toContain("idle");
   });
 
   it("shows 0.0% (not NaN/Infinity) when contextWindow is 0", () => {

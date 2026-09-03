@@ -338,6 +338,7 @@ export class Session {
   private followUpQueue: MessageQueue;
   private activeRun?: ActiveRun;
   private readonly sessionLog?: SessionLog;
+  private readonly compactionEngine?: CompactionEngine;
 
   public streamFn: StreamFn;
   public toolExecution: ToolExecutionMode;
@@ -359,6 +360,7 @@ export class Session {
         })
       : undefined;
     this.sessionLog = options.memory?.sessionLog;
+    this.compactionEngine = compactionEngine;
     this.hooks = buildHooks(options, compactionEngine);
     this.steeringQueue = newQueue(options.steeringMode ?? "one-at-a-time");
     this.followUpQueue = newQueue(options.followUpMode ?? "one-at-a-time");
@@ -456,6 +458,22 @@ export class Session {
     this.mutableState.errorMessage = undefined;
     this.clearFollowUpQueue();
     this.clearSteeringQueue();
+  }
+
+  /**
+   * Forces tiered-memory compaction right now (see `CompactionEngine.forceCompact`), mutating
+   * `state.messages` to the compacted result -- unlike the automatic per-turn compaction wired
+   * into `transformContext`, which only ever shrinks the ephemeral payload sent to the model for
+   * one request and never touches this array. Returns `false` (a no-op) if this session has no
+   * `memory` configured, or if there's no safe cut point yet (e.g. the whole history is still one
+   * recent, uncompactable turn).
+   */
+  async compact(): Promise<boolean> {
+    if (!this.compactionEngine) return false;
+    const compacted = await this.compactionEngine.forceCompact(this.mutableState.messages);
+    if (!compacted) return false;
+    this.mutableState.messages = compacted;
+    return true;
   }
 
   async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;

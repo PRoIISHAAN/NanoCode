@@ -193,7 +193,9 @@ function OAuthUnavailableNotice({ onAcknowledge }: { onAcknowledge: () => void }
   );
 }
 
-function ApiKeyPrompt({
+/** Exported for command-overlay.tsx's "/login" flow, which needs the exact same masked text-entry
+ * step mid-session -- no reason to duplicate it. */
+export function ApiKeyPrompt({
   providerName,
   onSubmit,
 }: {

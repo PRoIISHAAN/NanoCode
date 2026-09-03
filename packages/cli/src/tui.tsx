@@ -16,7 +16,7 @@ import {
   TrustStore,
 } from "@nanocode/agent";
 import { resolveModel, writeStoredModelSelection } from "@nanocode/ai";
-import { App, type ModelSetupController } from "@nanocode/tui";
+import { App, type ModelSetupController, type SlashCommandController } from "@nanocode/tui";
 import { render } from "ink";
 // Explicit React import: proven necessary by direct A/B testing (removing it reproduces
 // "ReferenceError: React is not defined" here even though packages/cli already has its own
@@ -32,9 +32,18 @@ import { render } from "ink";
 import React from "react";
 import {
   buildRuntimeForModel,
+  copyToClipboard,
   createModelsContext,
+  editViaExternalEditor,
+  exportTranscript,
+  listRecentSessions,
+  loadSessionMessages,
   type NanocodeSetup,
+  readClipboardImage,
+  readClipboardText,
+  readDroppedFile,
   runShellCommand,
+  switchModel,
   tryResolveConfiguredModel,
 } from "./setup.ts";
 import { ensureTrust, TrustDeniedError } from "./trust-prompt.ts";
@@ -55,7 +64,7 @@ async function main(): Promise<void> {
   const trustStore = await TrustStore.open();
   await ensureTrust(trustStore, process.cwd());
 
-  const { models } = createModelsContext();
+  const { models, credentials } = createModelsContext();
   const initialModel = await tryResolveConfiguredModel(models);
 
   // Holds whichever runtime actually ends up running -- built immediately below if a model was
@@ -99,10 +108,49 @@ async function main(): Promise<void> {
     },
   };
 
-  // Passed straight through -- runShellCommand spawns a real host shell process directly (like
-  // pi's own "!"), independent of any session/kernel, so there's no `runtime` to close over here
-  // at all (an earlier version of this function routed bang commands through the kernel instead
-  // and needed one; see setup.ts's runShellCommand for why that changed).
+  // Unlike `setup` above, every one of these DOES close over `runtime` -- "/model" mutates its
+  // session in place, "/new" tears it down and replaces it entirely. `switchModel`/`startNewSession`
+  // throw if called before any runtime exists, which can't actually happen: packages/tui only ever
+  // renders the running-session tree (the only place these are invoked from) once `session` is set,
+  // and `runtime` is always assigned before that -- either synchronously above, or inside
+  // `setup.finish()`'s `.then()`, which resolves before `onReady()` fires.
+  const slashCommands: SlashCommandController = {
+    listProviders: () => listProviderOptions(models),
+    listModels: (providerId) => listModelOptions(models, providerId),
+    login: (providerId, apiKey) => saveApiKey(models, providerId, apiKey),
+    logout: (providerId) => credentials.delete(providerId),
+    switchModel: (providerId, modelId) => {
+      if (!runtime) throw new Error("no active session");
+      return switchModel(runtime.session, models, providerId, modelId);
+    },
+    startNewSession: async () => {
+      if (!runtime) throw new Error("no active session");
+      const model = runtime.session.state.model;
+      await runtime.cleanup();
+      runtime = await buildRuntimeForModel(model, models);
+      // The runtime this replaces is already fully torn down and gone -- if it came from
+      // onboarding, `pendingFinish` would otherwise still resolve to that stale object once
+      // `main()`'s own `finally` block awaits it on exit, clobbering `runtime` right back to
+      // the already-cleaned-up one and skipping the real (current) runtime's own cleanup.
+      pendingFinish = undefined;
+      return runtime.session;
+    },
+    listRecentSessions,
+    loadSessionMessages,
+    copyToClipboard,
+    exportTranscript,
+  };
+
+  // Passed straight through -- runShellCommand/editViaExternalEditor/readClipboard*/readDroppedFile
+  // are all plain host functions with no `runtime`/session state of their own to close over (an
+  // earlier version of runShellCommand routed bang commands through the kernel instead and needed
+  // one; see setup.ts's own comment on why that changed).
+  //
+  // exitOnCtrlC: false -- app.tsx's RunningSession hand-rolls ctrl+c/ctrl+d itself (pi's own
+  // stateful scheme: ctrl+c clears the prompt box, twice in a row exits; ctrl+d exits only when
+  // already empty), so Ink's own default instant-exit-on-ctrl+c must be disabled here or it would
+  // race app.tsx's handler and always win (Ink's own internal handling runs before any `useInput`
+  // callback ever sees the keystroke).
   const { waitUntilExit } = render(
     <App
       session={initialSession}
@@ -110,7 +158,13 @@ async function main(): Promise<void> {
       version={PACKAGE_VERSION}
       cwd={process.cwd()}
       runShellCommand={runShellCommand}
+      slashCommands={slashCommands}
+      spawnEditor={editViaExternalEditor}
+      readClipboardImage={readClipboardImage}
+      readClipboardText={readClipboardText}
+      readDroppedFile={readDroppedFile}
     />,
+    { exitOnCtrlC: false },
   );
   try {
     await waitUntilExit();

@@ -198,26 +198,68 @@ export class CompactionEngine {
   constructor(private readonly options: CompactionOptions) {}
 
   async transform(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
-    if (messages.length < this.compactedThroughCount) {
-      // The live history is shorter than what we last compacted through -- e.g. `session.reset()`
-      // ran. Stale cache; drop it rather than reference messages that no longer exist.
-      this.compactedThroughCount = 0;
-      this.cachedSummary = undefined;
-    }
+    this.dropStaleCacheIfNeeded(messages);
 
     const rest = messages.slice(this.compactedThroughCount);
-    const withState = this.prependTaskState(
-      this.cachedSummary ? [summaryMessage(this.cachedSummary), ...rest] : rest,
-    );
+    const withState = this.prependTaskState(this.withCachedSummary(rest));
 
     const model = this.options.getModel();
     const triggerFraction = this.options.triggerFraction ?? DEFAULT_TRIGGER_FRACTION;
     const triggerTokens = Math.floor(model.contextWindow * triggerFraction);
     if (estimateTokens(withState) < triggerTokens) return withState;
 
+    const compacted = await this.compactNow(rest, signal);
+    if (!compacted) return withState; // nothing safe to compact yet; proceed over-threshold
+    return this.prependTaskState([summaryMessage(compacted.summary), ...compacted.keepTail]);
+  }
+
+  /**
+   * Forces a compaction pass right now, ignoring the token-threshold check `transform` normally
+   * gates on -- the engine behind a user-invoked "/compact", distinct from the automatic per-turn
+   * path above in one more important way: `transform`'s return value is only ever the ephemeral
+   * payload sent to the model for one request (the caller, `Session`'s `transformContext` hook,
+   * never writes it back into `state.messages`), whereas `Session.compact()` (agent.ts) DOES
+   * assign this method's result back into `state.messages` -- so a manual "/compact" visibly and
+   * permanently shrinks the session's own history, matching what other coding-agent CLIs' own
+   * "/compact" commands do, rather than only affecting the next request's context size.
+   *
+   * Returns `undefined` (a no-op) if there's no safe cut point yet -- e.g. the entire history is
+   * one still-recent turn -- so the caller can tell "nothing to compact" apart from "compacted".
+   */
+  async forceCompact(
+    messages: AgentMessage[],
+    signal?: AbortSignal,
+  ): Promise<AgentMessage[] | undefined> {
+    this.dropStaleCacheIfNeeded(messages);
+    const rest = messages.slice(this.compactedThroughCount);
+    const compacted = await this.compactNow(rest, signal);
+    if (!compacted) return undefined;
+    return this.prependTaskState([summaryMessage(compacted.summary), ...compacted.keepTail]);
+  }
+
+  private dropStaleCacheIfNeeded(messages: AgentMessage[]): void {
+    if (messages.length < this.compactedThroughCount) {
+      // The live history is shorter than what we last compacted through -- e.g. `session.reset()`
+      // ran. Stale cache; drop it rather than reference messages that no longer exist.
+      this.compactedThroughCount = 0;
+      this.cachedSummary = undefined;
+    }
+  }
+
+  private withCachedSummary(rest: AgentMessage[]): AgentMessage[] {
+    return this.cachedSummary ? [summaryMessage(this.cachedSummary), ...rest] : rest;
+  }
+
+  /** The actual "summarize the front, keep the tail" work shared by `transform`'s over-threshold
+   * path and `forceCompact`'s unconditional one. Returns `undefined` when `rest` has no
+   * turn-boundary-safe cut point yet (see `pickCutIndex`). */
+  private async compactNow(
+    rest: AgentMessage[],
+    signal?: AbortSignal,
+  ): Promise<{ summary: string; keepTail: AgentMessage[] } | undefined> {
     const keepRecentTokens = this.options.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
     const cutIndex = pickCutIndex(rest, keepRecentTokens);
-    if (cutIndex <= 0) return withState; // nothing safe to compact yet; proceed over-threshold
+    if (cutIndex <= 0) return undefined;
 
     const toCompact = rest.slice(0, cutIndex);
     const keepTail = rest.slice(cutIndex);
@@ -230,6 +272,7 @@ export class CompactionEngine {
       await buildRedactedTranscript(toCompact, this.options.sessionLog, archiveMinChars),
     );
 
+    const model = this.options.getModel();
     const response = await this.options.models.completeSimple(
       model,
       {
@@ -246,7 +289,7 @@ export class CompactionEngine {
     this.compactedThroughCount = this.compactedThroughCount + toCompact.length;
     this.cachedSummary = summaryText;
 
-    const firstKept = keepTail[0] ?? messages.at(-1);
+    const firstKept = keepTail[0] ?? rest.at(-1);
     await this.options.sessionLog.append({
       id: nextEntryId(),
       timestamp: Date.now(),
@@ -256,7 +299,7 @@ export class CompactionEngine {
         (firstKept as { timestamp?: number } | undefined)?.timestamp ?? Date.now(),
     });
 
-    return this.prependTaskState([summaryMessage(summaryText), ...keepTail]);
+    return { summary: summaryText, keepTail };
   }
 
   private prependTaskState(messages: AgentMessage[]): AgentMessage[] {

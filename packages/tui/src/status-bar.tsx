@@ -1,9 +1,12 @@
-// The status data block (cwd + tokens/context/cost/model/reasoning/busy), rendered below the
-// prompt box, framed by HorizontalRule above and below the prompt itself (app.tsx's RunningSession
+// The status data block (cwd + tokens/context/cost/model/reasoning), rendered below the prompt
+// box, framed by HorizontalRule above and below the prompt itself (app.tsx's RunningSession
 // composes the actual order) -- matching pi's own layout (rule, prompt, rule, cwd, stats), not the
 // data-block-above-the-prompt layout this component used to have on its own. Shows real session
 // data -- not pi's own undocumented "0.0%/0 (auto) unknown" format, which this project has no way
 // to verify the exact meaning of and would just be guessing at reproducing.
+//
+// Deliberately does NOT show a busy/idle indicator: the prompt box itself already communicates
+// that (its "…"/"working…" state, app.tsx's PromptInput), so this line no longer duplicates it.
 import { Box, Text, useStdout } from "ink";
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
 import React from "react";
@@ -21,7 +24,6 @@ export interface StatusBarProps {
   modelLabel: string;
   /** The session's thinking/reasoning level, e.g. "off", "low", "high". */
   reasoningLevel: string;
-  busy: boolean;
   /** Cumulative input ("sent") tokens across every assistant message so far this session. */
   totalInputTokens: number;
   /** Cumulative output ("received") tokens across every assistant message so far this session. */
@@ -60,22 +62,25 @@ export function StatusBar({
   cwd,
   modelLabel,
   reasoningLevel,
-  busy,
   totalInputTokens,
   totalOutputTokens,
   contextTokens,
   contextWindow,
   totalCostUsd,
 }: StatusBarProps) {
-  const dataLine =
+  const dataLineLeft =
     `↑${formatCompactTokens(totalInputTokens)} ↓${formatCompactTokens(totalOutputTokens)} · ` +
     `${formatPercent(contextTokens, contextWindow)}%/${formatCompactWindow(contextWindow)} · ` +
-    `$${totalCostUsd.toFixed(4)} · ${modelLabel} · ${reasoningLevel} · ${busy ? "busy" : "idle"}`;
+    `$${totalCostUsd.toFixed(4)}`;
+  const dataLineRight = `${modelLabel} · ${reasoningLevel}`;
 
   return (
     <Box flexDirection="column">
       <Text dimColor>{cwd}</Text>
-      <Text dimColor>{dataLine}</Text>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text dimColor>{dataLineLeft}</Text>
+        <Text dimColor>{dataLineRight}</Text>
+      </Box>
     </Box>
   );
 }

@@ -5,6 +5,10 @@ export default defineConfig({
     // Run every *.test.ts(x) under any package's test/ or src/ tree -- .tsx for packages/tui's
     // Ink-component tests (M5).
     include: ["packages/*/{src,test}/**/*.test.ts?(x)"],
+    // Unmounts every ink-testing-library render() after each test -- see vitest.setup.ts's own
+    // header comment for why this is necessary and how it was confirmed. Applied globally (not just
+    // to packages/tui) since it's a no-op for any test that never rendered anything through Ink.
+    setupFiles: ["./vitest.setup.ts"],
     // Kernel tests spawn a real Python subprocess (see packages/kernel/test) — give those
     // more headroom than Vitest's 5s default so a slow first-time venv bootstrap doesn't
     // flake the suite.

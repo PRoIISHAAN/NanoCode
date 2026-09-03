@@ -318,6 +318,98 @@ describe("CompactionEngine", () => {
     expect(result).toEqual(resetBatch); // no stale cached summary prepended
   });
 
+  describe("forceCompact", () => {
+    it("compacts unconditionally when there IS a safe cut point, appending a compaction log entry same as the automatic path", async () => {
+      const { models } = fakeModelsWithCanned("The user is debugging a ValueError.");
+      const engine = new CompactionEngine({
+        models,
+        getModel: () => FAKE_MODEL, // contextWindow 1000, but forceCompact ignores the trigger
+        sessionLog,
+        keepRecentTokens: 1,
+        getTaskState: () => undefined,
+      });
+
+      // Nowhere near the automatic transform() token threshold -- a handful of short messages --
+      // but there IS a safe turn-boundary cut point (the leading "go"/first exchange), which is
+      // all forceCompact requires.
+      const messages: AgentMessage[] = [
+        userText("go", 1),
+        assistantText("step one"),
+        userText("thanks, what's next?", 3),
+        assistantText("here is the plan"),
+      ];
+
+      const result = await engine.forceCompact(messages);
+
+      expect(result).toBeDefined();
+      const compacted = result as AgentMessage[];
+      // Kept verbatim: at least the final message, after the summary.
+      expect(compacted.at(-1)).toEqual(messages.at(-1));
+      const summaryText = (compacted[0] as { content: { text: string }[] }).content[0].text;
+      expect(summaryText).toContain("<compaction-summary>");
+      expect(summaryText).toContain("The user is debugging a ValueError.");
+
+      const compactionEntries = sessionLog.all.filter((e) => e.kind === "compaction");
+      expect(compactionEntries).toHaveLength(1);
+    });
+
+    it("returns undefined (no-op, no log entry) when there's no safe cut point yet -- a single huge recent turn", async () => {
+      const { models } = fakeModelsWithCanned("unused");
+      const engine = new CompactionEngine({
+        models,
+        getModel: () => FAKE_MODEL,
+        sessionLog,
+        keepRecentTokens: 8_000, // default-sized budget -- everything here counts as "recent"
+        getTaskState: () => undefined,
+      });
+
+      // One single turn: no safe boundary exists before it (index 0 is the only candidate, and
+      // pickCutIndex treats "nothing before this" as "nothing to compact").
+      const messages: AgentMessage[] = [userText("go", 1), assistantText("a".repeat(2000))];
+
+      const result = await engine.forceCompact(messages);
+
+      expect(result).toBeUndefined();
+      expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(0);
+    });
+
+    it("still compacts a short conversation nowhere near the token threshold -- unlike transform(), which would just return it unchanged", async () => {
+      const { models } = fakeModelsWithCanned("Short summary.");
+      const engineForTransform = new CompactionEngine({
+        models,
+        getModel: () => FAKE_MODEL, // contextWindow 1000; triggerFraction defaults to 0.7 (~700 tokens)
+        sessionLog,
+        keepRecentTokens: 1,
+        getTaskState: () => undefined,
+      });
+
+      const messages: AgentMessage[] = [
+        userText("go", 1),
+        assistantText("step one"),
+        userText("thanks, what's next?", 3),
+        assistantText("here is the plan"),
+      ];
+
+      // transform() on this same short conversation is a pure passthrough: far under threshold.
+      const transformResult = await engineForTransform.transform(messages);
+      expect(transformResult).toEqual(messages);
+      expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(0);
+
+      // A fresh engine (forceCompact was never preceded by transform() triggering) still compacts
+      // it right away, proving forceCompact doesn't depend on transform() having run first.
+      const engineForForce = new CompactionEngine({
+        models,
+        getModel: () => FAKE_MODEL,
+        sessionLog,
+        keepRecentTokens: 1,
+        getTaskState: () => undefined,
+      });
+      const forced = await engineForForce.forceCompact(messages);
+      expect(forced).toBeDefined();
+      expect(sessionLog.all.filter((e) => e.kind === "compaction")).toHaveLength(1);
+    });
+  });
+
   it("prepends the current task state on every call, independent of compaction triggering", async () => {
     const { models } = fakeModelsWithCanned("unused");
     let goal = "first goal";

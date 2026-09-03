@@ -1,13 +1,24 @@
 // tryResolveConfiguredModel's fallback logic had zero test coverage before this -- the exact path
 // where a real user hit a real bug (onboarding re-triggering every run despite a working saved
 // credential, because only the credential was persisted, never the provider/model choice itself).
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentMessage } from "@nanocode/agent";
+import { SessionLog } from "@nanocode/agent";
 import type { AuthContext } from "@nanocode/ai";
 import { createModelsRegistry, FileCredentialStore, writeStoredModelSelection } from "@nanocode/ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runShellCommand, tryResolveConfiguredModel } from "../src/setup.ts";
+import {
+  copyToClipboard,
+  createModelsContext,
+  exportTranscript,
+  listRecentSessions,
+  loadSessionMessages,
+  runShellCommand,
+  tryResolveConfiguredModel,
+} from "../src/setup.ts";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -184,5 +195,186 @@ describe("runShellCommand", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("createModelsContext", () => {
+  it("returns both the models registry AND the FileCredentialStore backing it, not just the models", () => {
+    // Regression coverage for the return-shape change: this used to return only `{ models }` --
+    // "/logout" (tui.tsx's SlashCommandController) needs the credentials store directly (to call
+    // `.delete(providerId)`), so createModelsContext now hands both back from one call instead of
+    // constructing a second, disconnected FileCredentialStore.
+    const { models, credentials } = createModelsContext();
+    expect(models).toBeDefined();
+    expect(credentials).toBeInstanceOf(FileCredentialStore);
+    // And it's genuinely the SAME store the registry uses, not a look-alike second instance: a
+    // credential written directly through it is visible to the registry's own auth check.
+    expect(typeof models.checkAuth).toBe("function");
+  });
+});
+
+describe("listRecentSessions / loadSessionMessages", () => {
+  // Both read `.nanocode/sessions/*.jsonl` relative to process.cwd() with no override parameter,
+  // so isolating them means actually chdir'ing into a throwaway directory for the test -- restored
+  // in `afterEach` no matter how the test ends, since `fileParallelism: false` (vitest.config.ts)
+  // means every other test file in the run shares this same process's cwd.
+  const ORIGINAL_CWD = process.cwd();
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "nanocode-sessions-cwd-"));
+    process.chdir(dir);
+  });
+
+  afterEach(async () => {
+    process.chdir(ORIGINAL_CWD);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function userMessage(text: string, timestamp: number): AgentMessage {
+    return { role: "user", content: text, timestamp } as AgentMessage;
+  }
+
+  function assistantMessage(text: string, timestamp: number): AgentMessage {
+    return {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      timestamp,
+    } as AgentMessage;
+  }
+
+  it("returns [] rather than throwing when .nanocode/sessions doesn't exist yet", async () => {
+    await expect(listRecentSessions()).resolves.toEqual([]);
+  });
+
+  it("lists sessions newest-mtime-first, with a truncated title preview, messageCount, and '(no messages yet)' when there's no user message", async () => {
+    const older = await SessionLog.open(join(".nanocode", "sessions", "older.jsonl"), "older");
+    await older.append({
+      id: "e1",
+      timestamp: 1,
+      kind: "message",
+      message: userMessage("a".repeat(80), 1), // long enough to require truncation to ~60 chars
+    });
+    await older.append({
+      id: "e2",
+      timestamp: 2,
+      kind: "message",
+      message: assistantMessage("reply", 2),
+    });
+
+    // Ensure a real, later mtime for the second file -- filesystem mtime resolution can be as
+    // coarse as ~10ms on some platforms, and these two files must sort deterministically.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const empty = await SessionLog.open(join(".nanocode", "sessions", "empty.jsonl"), "empty");
+    void empty; // no message entries appended -- exercises the "(no messages yet)" placeholder
+
+    const summaries = await listRecentSessions();
+
+    expect(summaries.map((s) => s.id)).toEqual(["empty", "older"]); // newest mtime first
+    const olderSummary = summaries.find((s) => s.id === "older");
+    expect(olderSummary?.messageCount).toBe(2);
+    expect(olderSummary?.title.length).toBeLessThanOrEqual(61); // 60 chars + the "…" ellipsis
+    expect(olderSummary?.title.startsWith("a".repeat(60))).toBe(true);
+    expect(olderSummary?.title.endsWith("…")).toBe(true);
+
+    const emptySummary = summaries.find((s) => s.id === "empty");
+    expect(emptySummary?.title).toBe("(no messages yet)");
+    expect(emptySummary?.messageCount).toBe(0);
+  });
+
+  it("respects the `limit` parameter", async () => {
+    for (const id of ["a", "b", "c"]) {
+      const log = await SessionLog.open(join(".nanocode", "sessions", `${id}.jsonl`), id);
+      await log.append({ id: "e1", timestamp: 1, kind: "message", message: userMessage("hi", 1) });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const summaries = await listRecentSessions(2);
+    expect(summaries).toHaveLength(2);
+  });
+
+  it("loadSessionMessages round-trips exactly the messages that were appended, in order", async () => {
+    const log = await SessionLog.open(
+      join(".nanocode", "sessions", "roundtrip.jsonl"),
+      "roundtrip",
+    );
+    const messages = [
+      userMessage("first", 1),
+      assistantMessage("second", 2),
+      userMessage("third", 3),
+    ];
+    for (let i = 0; i < messages.length; i++) {
+      await log.append({ id: `e${i}`, timestamp: i, kind: "message", message: messages[i] });
+    }
+
+    await expect(loadSessionMessages("roundtrip")).resolves.toEqual(messages);
+  });
+});
+
+describe("copyToClipboard", () => {
+  // Inherently platform/environment-dependent: copyToClipboard shells out to a real clipboard
+  // utility (pbcopy/clip/xclip) that may not be installed in a given CI environment (most commonly
+  // xclip missing on a minimal Linux box). Rather than assert unconditional success, this checks
+  // whether the utility this platform would use is actually present first and adapts.
+  function currentPlatformUtility(): string {
+    if (process.platform === "darwin") return "pbcopy";
+    if (process.platform === "win32") return "clip";
+    return "xclip";
+  }
+
+  function utilityIsInstalled(name: string): boolean {
+    try {
+      execFileSync(process.platform === "win32" ? "where" : "which", [name], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("succeeds when this platform's clipboard utility is installed; otherwise rejects with a real error instead of silently succeeding", async () => {
+    const installed = utilityIsInstalled(currentPlatformUtility());
+    if (installed) {
+      await expect(copyToClipboard("hello from nanocode's test suite")).resolves.toBeUndefined();
+    } else {
+      await expect(copyToClipboard("hello from nanocode's test suite")).rejects.toThrow();
+    }
+  });
+});
+
+describe("exportTranscript", () => {
+  const ORIGINAL_CWD = process.cwd();
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "nanocode-export-cwd-"));
+    process.chdir(dir);
+  });
+
+  afterEach(async () => {
+    process.chdir(ORIGINAL_CWD);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("writes content to a real, timestamped file in process.cwd() with the given extension, and returns a path that exists", async () => {
+    const path = await exportTranscript('{"hello":"world"}', "json");
+
+    expect(path).toMatch(/^nanocode-export-\d+\.json$/);
+    const written = await readFile(path, "utf8");
+    expect(written).toBe('{"hello":"world"}');
+
+    const filesInCwd = await readdir(".");
+    expect(filesInCwd).toContain(path);
+  });
+
+  it("uses the given extension (e.g. 'md') and never clobbers a repeated export within the same process", async () => {
+    const first = await exportTranscript("# transcript one", "md");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const second = await exportTranscript("# transcript two", "md");
+
+    expect(first).toMatch(/\.md$/);
+    expect(second).toMatch(/\.md$/);
+    expect(first).not.toBe(second);
+    await expect(readFile(first, "utf8")).resolves.toBe("# transcript one");
+    await expect(readFile(second, "utf8")).resolves.toBe("# transcript two");
   });
 });
