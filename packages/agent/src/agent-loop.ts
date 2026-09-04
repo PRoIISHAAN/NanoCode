@@ -4,7 +4,7 @@
  * Works entirely in terms of `AgentMessage`; only `convertToLlm` at the request boundary produces
  * the `Message[]` shape the provider actually understands.
  *
- * Solves the same problem prime-agent's `agent-loop.ts` solves (a driver plus a set of optional
+ * `agent-loop.ts` solves (a driver plus a set of optional
  * hooks for steering/follow-up/continuation, sequential-vs-parallel tool execution, abort
  * propagation at every await point) -- independently implemented below, including a materially
  * different decomposition for tool execution: instead of three free functions (prepare / execute /

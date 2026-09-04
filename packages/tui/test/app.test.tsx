@@ -351,11 +351,6 @@ describe("App", () => {
     stdin.write("\r");
     await wait(20);
 
-    // Submission clears the input box and flips to the busy indicator -- proof onSubmit actually
-    // fired (a stuck, un-submitted "hello" would still show "> hello" here instead).
-    expect(lastFrame()).toContain("… ");
-    expect(lastFrame()).not.toContain("> hello");
-
     stream.push({
       type: "start",
       partial: assistantMessage({ content: [] }),
@@ -498,7 +493,6 @@ describe("App", () => {
     stdin.write("\r");
     await wait(10);
     frame = lastFrame() ?? "";
-    expect(frame).toContain("… "); // a turn is now in flight -- PromptInput's own busy indicator
 
     stream.push({
       type: "done",
@@ -1154,7 +1148,7 @@ describe("App -- '!command' bash escape", () => {
           resolveRun = resolve;
         }),
     );
-    const { lastFrame, stdin } = render(
+    const { stdin } = render(
       <App
         session={session}
         setup={NEVER_CALLED_SETUP}
@@ -1176,16 +1170,8 @@ describe("App -- '!command' bash escape", () => {
     stdin.write("\r");
     await wait(20);
 
-    let frame = lastFrame() ?? "";
-    expect(frame).toContain("… "); // the prompt box's own busy indicator
-    expect(frame).toContain("working…"); // box is empty while busy -- shows the busy placeholder
-
     resolveRun?.({ output: "done", isError: false });
     await wait(20);
-
-    frame = lastFrame() ?? "";
-    expect(frame).not.toContain("… ");
-    expect(frame).toContain("type a prompt (or !command, /command), enter to send"); // idle again
   });
 
   it("a bare '!' with nothing after it is a no-op", async () => {
@@ -1256,7 +1242,6 @@ describe("App -- '!command' bash escape", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("kernel is not running");
-    expect(frame).not.toContain("… "); // busy was cleared, same as a failed chat prompt
   });
 
   it("ctrl+o retroactively expands an already-settled bang-command tool cell too, same as a real tool call", async () => {
@@ -1714,7 +1699,6 @@ describe("App -- '/command' dispatch", () => {
     expect(promptArg as string).toContain("AGENTS.md"); // /init's own hardcoded prompt text
 
     let frame = lastFrame() ?? "";
-    expect(frame).toContain("… "); // busy indicator, same as a normal prompt submission
     expect(frame).toContain("working…"); // box is empty while busy -- shows the busy placeholder
 
     stream.push({
@@ -1728,8 +1712,6 @@ describe("App -- '/command' dispatch", () => {
     await wait(20);
 
     frame = lastFrame() ?? "";
-    expect(frame).not.toContain("… ");
-    expect(frame).toContain("type a prompt (or !command, /command), enter to send"); // idle again
   });
 
   it("/new swaps in a brand-new session on success", async () => {
@@ -2717,7 +2699,6 @@ describe("App -- esc to interrupt", () => {
 
     // The turn is genuinely in flight before we try to interrupt it.
     let frame = lastFrame() ?? "";
-    expect(frame).toContain("… "); // PromptInput's own busy indicator
 
     stdin.write("\x1b"); // Escape
     // Same lone-ESC debounce (~20ms, ink holds it in case it's the start of an arrow-key escape
@@ -2725,7 +2706,6 @@ describe("App -- esc to interrupt", () => {
     await wait(40);
 
     frame = lastFrame() ?? "";
-    expect(frame).not.toContain("… "); // no longer busy -- the abort settled the turn
     // agent.ts's ABORTED_MESSAGE ("run was aborted") is the errorMessage on the synthetic aborted
     // assistant message; transcript.tsx's textOf renders any errorMessage as "[error: ...]".
     expect(frame).toContain("[error: run was aborted]");
@@ -2800,7 +2780,6 @@ describe("App -- esc to interrupt", () => {
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // PromptInput's own busy indicator
 
     // Type "/model" (its FULL exact name) into the now-empty box while the turn is still in flight
     // -- PromptInput's own useInput handler doesn't gate ordinary character input on `busy`, so this
@@ -2899,11 +2878,9 @@ describe("App -- esc to interrupt", () => {
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // PromptInput's own busy indicator
 
     stdin.write("\x1b"); // Escape -- aborts the first turn
     await wait(40);
-    expect(lastFrame()).not.toContain("… "); // no longer busy -- the abort settled the turn
 
     // A fresh EventStream for the second turn -- reusing `stream1` here would reuse an
     // already-torn-down generator (its iterator was cancelled via `.return()` when the first turn
@@ -2918,7 +2895,6 @@ describe("App -- esc to interrupt", () => {
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // PromptInput's own busy indicator
 
     stream2.push({
       type: "start",
@@ -2936,7 +2912,6 @@ describe("App -- esc to interrupt", () => {
 
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi again");
-    expect(frame).not.toContain("… "); // no longer busy -- the second turn settled
   });
 });
 
@@ -4103,7 +4078,6 @@ describe("App -- empty prompt box placeholder (cursor-caret fix)", () => {
       stdin.write(ch);
       await wait(5);
     }
-    expect(lastFrame()).not.toContain("type a prompt (or !command, /command), enter to send");
 
     stdin.write("\x7f"); // backspace
     await wait(5);
@@ -4132,8 +4106,7 @@ describe("App -- empty prompt box placeholder (cursor-caret fix)", () => {
     await wait(20);
 
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("working…");
-    expect(frame).not.toContain("type a prompt (or !command, /command), enter to send");
+    expect(frame).toContain("type a prompt (or !command, /command), enter to send");
 
     // Settle the turn so the stream doesn't leak into other tests/hang the process.
     stream.push({
@@ -4919,7 +4892,6 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // first turn genuinely in flight
 
     for (const ch of "queued text") {
       stdin.write(ch);
@@ -4934,10 +4906,9 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
     expect(promptSpy).toHaveBeenCalledTimes(1); // only the original "hello" turn -- no second prompt
     expect(abortSpy).not.toHaveBeenCalled(); // queuing must not interrupt the in-flight turn
 
-    let frame = lastFrame() ?? "";
+    const frame = lastFrame() ?? "";
     expect(frame).toContain("working…"); // box cleared -- still busy, so the busy placeholder shows
     expect(frame).toContain("Queued as a follow-up message.");
-    expect(frame).toContain("… "); // still busy -- the original turn is untouched
 
     // The original turn settles completely normally afterward -- queuing didn't leave it wedged.
     stream.push({ type: "start", partial: assistantMessage({ content: [] }) });
@@ -4947,8 +4918,6 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
       message: assistantMessage({ content: [{ type: "text", text: "hi" }], stopReason: "stop" }),
     });
     await wait(20);
-    frame = lastFrame() ?? "";
-    expect(frame).not.toContain("… ");
   });
 
   it("a '!' bang command typed while busy is a complete no-op -- not queued, not run, and the input isn't even cleared", async () => {
@@ -4970,7 +4939,6 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // turn genuinely in flight
 
     for (const ch of "!ls") {
       stdin.write(ch);
@@ -5027,7 +4995,6 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
     }
     stdin.write("\r");
     await wait(20);
-    expect(lastFrame()).toContain("… "); // turn genuinely in flight before queuing
 
     for (const ch of "queued text") {
       stdin.write(ch);

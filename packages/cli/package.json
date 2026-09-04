@@ -5,11 +5,12 @@
   "type": "module",
   "main": "./src/index.ts",
   "bin": {
-    "nanocode": "./src/index.ts"
+    "nanocode": "./dist/cli.js"
   },
   "scripts": {
     "cli": "tsx src/index.ts",
-    "tui": "tsx src/tui.tsx"
+    "tui": "tsx src/index.ts",
+    "build": "node scripts/build.mjs"
   },
   "dependencies": {
     "@nanocode/agent": "0.1.0",
@@ -18,5 +19,8 @@
     "@nanocode/tui": "0.1.0",
     "ink": "7.1.1",
     "react": "19.2.8"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

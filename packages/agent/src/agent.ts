@@ -3,7 +3,7 @@
  * streaming status, pending tool calls) and an event-subscription API, so a caller can hold one
  * long-lived object, call `prompt()`/`continue()` on it, and read `session.state` at any time.
  *
- * Solves the same problem prime-agent's `Agent` class solves (something has to own the mutable
+ * `Agent` class solves (something has to own the mutable
  * state agent-loop.ts's pure functions don't carry between calls, and something has to turn
  * `steer()`/`followUp()` calls into the poll hooks agent-loop.ts expects) -- independently
  * implemented with two structural differences worth calling out: the ~15 loop-configuration

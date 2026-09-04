@@ -11,13 +11,35 @@
 // cleanly. The rest has a natural home in a later milestone (protocol repair and snapshotting
 // fit naturally alongside M3's session persistence work).
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // `python -m nanocode_kernel.repl` needs `nanocode_kernel` importable. Since it isn't pip-installed
 // anywhere, PYTHONPATH is pointed at the directory containing the package -- resolved from this
 // file's own location so it works no matter what the caller's process cwd is.
-const KERNEL_PACKAGE_ROOT = path.resolve(fileURLToPath(new URL("../python", import.meta.url)));
+//
+// Two candidate offsets, not one: `scripts/build.mjs` bundles this file (along with the rest of
+// @nanocode/agent/ai/kernel/tui) directly from source into packages/cli/dist/cli.js for the global
+// `nanocode` binary -- at that point `import.meta.url` no longer points at
+// packages/kernel/src/repl-kernel-manager.ts, it points at the BUNDLE's own location, two
+// directories further from packages/kernel/python than this file's real, unbundled position is.
+// Rather than coupling this resolution to the build tool (e.g. an esbuild `define`), it just tries
+// both real, known offsets and picks whichever actually exists on disk -- correct unmodified in
+// dev (`tsx`, unbundled) and in the bundled global binary alike, and never silently wrong if a
+// third packaging shape gets added later (it'll throw instead of guessing).
+export function resolveKernelPackageRoot(): string {
+  const here = fileURLToPath(import.meta.url);
+  const devCandidate = path.resolve(path.dirname(here), "../python");
+  if (existsSync(devCandidate)) return devCandidate;
+  const bundledCandidate = path.resolve(path.dirname(here), "../../kernel/python");
+  if (existsSync(bundledCandidate)) return bundledCandidate;
+  throw new Error(
+    `Could not locate the kernel's python package near ${here} (checked ${devCandidate} and ${bundledCandidate})`,
+  );
+}
+
+export const KERNEL_PACKAGE_ROOT = resolveKernelPackageRoot();
 
 const SUPPORTED_PROTOCOL_VERSION = 3;
 const HANDSHAKE_TIMEOUT_MS = 30_000;

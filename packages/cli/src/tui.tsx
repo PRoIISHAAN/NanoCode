@@ -1,11 +1,23 @@
-#!/usr/bin/env node
 // The interactive entrypoint (M5, onboarding added post-M7 per decisions/0011-tui-onboarding.md):
-// `npm run tui`. Shares setup.ts with the headless `run` command in index.ts for the actual
-// kernel/session/telemetry/MCP wiring, but -- unlike headless `run`, which still fails fast on
-// missing model config -- this entrypoint never lets a missing model crash the process before Ink
-// renders. It renders unconditionally, and hands `App` a `ModelSetupController` closing over
-// `MutableModels`/`resolveModel` so packages/tui itself never has to import packages/kernel or
-// packages/ai directly (decisions/0005-tui-stack.md's invariant) to drive onboarding.
+// launched by bare `nanocode` (index.ts's own dispatch, see its own comment on why). Shares
+// setup.ts with the headless `run` command in index.ts for the actual kernel/session/telemetry/MCP
+// wiring, but -- unlike headless `run`, which still fails fast on missing model config -- this
+// entrypoint never lets a missing model crash the process before Ink renders. It renders
+// unconditionally, and hands `App` a `ModelSetupController` closing over `MutableModels`/
+// `resolveModel` so packages/tui itself never has to import packages/kernel or packages/ai
+// directly (decisions/0005-tui-stack.md's invariant) to drive onboarding.
+//
+// A pure module now, not its own entrypoint -- no shebang, no top-level self-invocation. It used to
+// run standalone (`tsx src/tui.tsx`, its own `main().catch(...)` at the bottom), but that became a
+// real problem once `scripts/build.mjs` started bundling this file INTO packages/cli/src/index.ts's
+// own output for the global `nanocode` binary: a bundle merges what used to be two separate
+// "am I the entrypoint" files into one physical file, so a self-check based on `import.meta.url`
+// (the standard ESM "is this the main module" pattern) can no longer tell them apart -- it would
+// either always or never fire, regardless of which mode the user actually asked for. Making this
+// file export `runTui` and nothing else, with index.ts as the ONE real entrypoint in both dev and
+// bundled builds, sidesteps the ambiguity entirely rather than trying to detect it at runtime.
+// `npm run tui` (packages/cli/package.json) now runs `tsx src/index.ts` with no arguments instead
+// of this file directly, which reaches the exact same `runTui()` call index.ts's own dispatch does.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -56,7 +68,7 @@ import {
   switchModel,
   tryResolveConfiguredModel,
 } from "./setup.ts";
-import { ensureTrust, TrustDeniedError } from "./trust-prompt.ts";
+import { ensureTrust } from "./trust-prompt.ts";
 
 // Read directly from this package's own package.json rather than hardcoding a version string that
 // would silently drift out of sync -- same fileURLToPath(new URL(...)) pattern
@@ -106,7 +118,7 @@ function exitFullscreen(): void {
 // nothing in Node can intercept that one, by design.)
 process.on("exit", exitFullscreen);
 
-async function main(): Promise<void> {
+export async function runTui(): Promise<void> {
   // Trust gating is unchanged by onboarding: it still runs before anything else, as a plain
   // pre-Ink prompt, exactly as it did before this change -- onboarding only ever affects the
   // *model* configuration step, never the trust boundary.
@@ -261,13 +273,3 @@ async function main(): Promise<void> {
     await runtime?.cleanup();
   }
 }
-
-main().catch((error) => {
-  if (error instanceof TrustDeniedError) {
-    console.error(`Not trusted: ${error.dirPath}. Nothing was executed.`);
-    process.exitCode = 1;
-    return;
-  }
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  process.exitCode = 1;
-});

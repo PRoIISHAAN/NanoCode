@@ -1117,7 +1117,7 @@ function PromptInput({
   /** Same 2-character width for every line's own marker ("> "/"… "/"  ") -- used below to convert
    * between a column within a bare logical line and a column within what Ink actually wraps (marker
    * + line, squashed into one `<Text>` per PromptInput's own render, see its header comment). */
-  const markerFor = (lineIndex: number) => (lineIndex === 0 ? (busy ? "… " : "> ") : "  ");
+  const markerFor = (lineIndex: number) => (lineIndex === 0 ? "> " : "  ");
   /** Ink wraps each line's rendered content (marker + text, squashed into one `<Text>`) via
    * `wrap-ansi` internally (ink/build/wrap-text.js calls it with these exact options) -- replicating
    * that here, with the SAME library and options, is what lets up/down-arrow navigation below land on
@@ -1801,11 +1801,7 @@ function PromptInput({
   // showed no cursor whatsoever, just the dim placeholder text with no indication of where typing
   // would begin; a real, reported gap, not just a cosmetic nicety.
   const placeholder =
-    input.length === 0
-      ? busy
-        ? "working…"
-        : "type a prompt (or !command, /command), enter to send"
-      : undefined;
+    input.length === 0 ? "type a prompt (or !command, /command), enter to send" : undefined;
   // Multi-line-aware: option+enter (above) can put real "\n"s into `input` now, so the box has to
   // render each line as its own row rather than one flat row of three Text siblings -- that old
   // layout put the "before"/cursor/"after" slices side by side regardless of embedded newlines,
@@ -1833,7 +1829,7 @@ function PromptInput({
       {lines.map((line, index) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: `lines` is rebuilt fresh from `input` on every render, never reordered or spliced -- index is a stable, sufficient key here.
         <Text key={index}>
-          <Text color={busy ? "gray" : "green"}>{index === 0 ? (busy ? "… " : "> ") : "  "}</Text>
+          <Text color={"gray"}>{index === 0 ? "> " : "  "}</Text>
           {index === cursorLine ? (
             <>
               <Text>{line.slice(0, cursorCol)}</Text>

@@ -1,6 +1,6 @@
-// Local, exporter-free-by-default telemetry (pi's pattern, not prime-agent's default-on phone-home
-// analytics) built on `Session`'s existing `AgentEvent` bus rather than new instrumentation
-// scattered through agent-loop.ts -- see decisions/0008-project-trust-sandbox-telemetry.md.
+// Local, exporter-free-by-default telemetry built on `Session`'s existing `AgentEvent` bus
+// rather than new instrumentation scattered through agent-loop.ts
+// clear-- see decisions/0008-project-trust-sandbox-telemetry.md.
 import type { AgentEvent } from "./types.ts";
 
 export interface TelemetrySpan {
