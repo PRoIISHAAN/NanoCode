@@ -43,6 +43,12 @@ const NEVER_CALLED_SETUP: ModelSetupController = {
   login: () => {
     throw new Error("setup.login() should never be called when a session is provided");
   },
+  loginOAuth: () => {
+    throw new Error("setup.loginOAuth() should never be called when a session is provided");
+  },
+  openUrl: () => {
+    throw new Error("setup.openUrl() should never be called when a session is provided");
+  },
   finish: () => {
     throw new Error("setup.finish() should never be called when a session is provided");
   },
@@ -107,6 +113,16 @@ const NEVER_CALLED_SLASH_COMMANDS: SlashCommandController = {
   login: () => {
     throw new Error(
       "SlashCommandController.login() should never be called by a test that doesn't exercise it",
+    );
+  },
+  loginOAuth: () => {
+    throw new Error(
+      "SlashCommandController.loginOAuth() should never be called by a test that doesn't exercise it",
+    );
+  },
+  openUrl: () => {
+    throw new Error(
+      "SlashCommandController.openUrl() should never be called by a test that doesn't exercise it",
     );
   },
   logout: () => {
@@ -689,10 +705,22 @@ describe("App", () => {
     });
     const controller: ModelSetupController = {
       listProviders: async () => [
-        { id: "anthropic", name: "Anthropic", hasCredential: true, supportsApiKeyLogin: true },
+        {
+          id: "anthropic",
+          name: "Anthropic",
+          hasCredential: true,
+          supportsApiKeyLogin: true,
+          supportsOAuthLogin: false,
+        },
       ],
       listModels: () => [{ id: "claude-sonnet-5", name: "Claude Sonnet 5" }],
       login: vi.fn(),
+      loginOAuth: vi.fn(() => {
+        throw new Error("setup.loginOAuth() should never be called by this api-key-only test");
+      }),
+      openUrl: vi.fn(() => {
+        throw new Error("setup.openUrl() should never be called by this api-key-only test");
+      }),
       finish: vi.fn(async () => readySession),
     };
 
@@ -845,7 +873,7 @@ describe("App -- '!command' bash escape", () => {
     // Exactly the {user, toolResult} pair handleSubmit's buildBangCommandEntries builds -- pushed
     // into REAL session.state.messages this time, not the local-only atom "!!" uses.
     expect(session.state.messages).toHaveLength(2);
-    const [userEntry, resultEntry] = session.state.messages as [
+    const [userEntry, resultEntry] = session.state.messages as unknown as [
       { role: string; content: unknown },
       { role: string; toolName?: string; content: unknown; isError?: boolean },
     ];
@@ -2026,7 +2054,13 @@ describe("App -- '/command' dispatch", () => {
   it("/login and /login <provider> both show the overlay UI, never calling login directly from the prompt-submission path", async () => {
     const login = vi.fn(async () => {});
     const listProviders = vi.fn(async () => [
-      { id: "anthropic", name: "Anthropic", hasCredential: false, supportsApiKeyLogin: true },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        hasCredential: false,
+        supportsApiKeyLogin: true,
+        supportsOAuthLogin: false,
+      },
     ]);
     const slashCommands = fakeSlashCommands({ login, listProviders });
     const session = new Session({
@@ -2055,6 +2089,13 @@ describe("App -- '/command' dispatch", () => {
     stdin.write("\r");
     await wait(30);
 
+    // "/login" with no arg now asks "Log in how?" first (command-overlay.tsx's own
+    // "login-method-choice" phase) before ever fetching providers -- pick "API Key" (already
+    // highlighted first) to reach the (filtered) provider list.
+    expect(lastFrame()).toContain("Log in how?");
+    stdin.write("\r");
+    await wait(30);
+
     expect(lastFrame()).toContain("Log in to which provider?"); // CommandOverlay's own picker text
     expect(login).not.toHaveBeenCalled();
   });
@@ -2062,7 +2103,13 @@ describe("App -- '/command' dispatch", () => {
   it("/login <provider> pre-selects it and shows the API-key entry step, never calling login directly", async () => {
     const login = vi.fn(async () => {});
     const listProviders = vi.fn(async () => [
-      { id: "anthropic", name: "Anthropic", hasCredential: false, supportsApiKeyLogin: true },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        hasCredential: false,
+        supportsApiKeyLogin: true,
+        supportsOAuthLogin: false,
+      },
     ]);
     const slashCommands = fakeSlashCommands({ login, listProviders });
     const session = new Session({
@@ -3191,7 +3238,13 @@ describe("App -- ctrl+l opens the model picker overlay directly", () => {
     });
     const slashCommands = fakeSlashCommands({
       listProviders: vi.fn(async () => [
-        { id: "anthropic", name: "Anthropic", hasCredential: true, supportsApiKeyLogin: true },
+        {
+          id: "anthropic",
+          name: "Anthropic",
+          hasCredential: true,
+          supportsApiKeyLogin: true,
+          supportsOAuthLogin: false,
+        },
       ]),
     });
     const { lastFrame, stdin } = renderApp(session, { slashCommands });
@@ -3214,8 +3267,20 @@ describe("App -- ctrl+p / shift+ctrl+p cycles models", () => {
       session.state.model = { ...FAKE_MODEL, provider: providerId, id: modelId };
     });
     const listProviders = vi.fn(async () => [
-      { id: "fake-provider", name: "Fake", hasCredential: true, supportsApiKeyLogin: true },
-      { id: "other", name: "Other", hasCredential: true, supportsApiKeyLogin: true },
+      {
+        id: "fake-provider",
+        name: "Fake",
+        hasCredential: true,
+        supportsApiKeyLogin: true,
+        supportsOAuthLogin: false,
+      },
+      {
+        id: "other",
+        name: "Other",
+        hasCredential: true,
+        supportsApiKeyLogin: true,
+        supportsOAuthLogin: false,
+      },
     ]);
     const listModels = vi.fn((providerId: string) =>
       providerId === "fake-provider"
@@ -3355,7 +3420,7 @@ describe("App -- drop-file-to-attach (no keybinding; triggered by submitting a r
     // dedicated describe block below (which also covers the reordering itself).
     const readDroppedFile: ReadDroppedFile = vi.fn(async (candidatePath: string) =>
       candidatePath === "~/file.txt"
-        ? { kind: "text", content: "FILE CONTENT", path: "/home/x/file.txt" }
+        ? { kind: "text" as const, content: "FILE CONTENT", path: "/home/x/file.txt" }
         : undefined,
     );
     const { stdin } = renderApp(session, { readDroppedFile });
@@ -3383,7 +3448,12 @@ describe("App -- drop-file-to-attach (no keybinding; triggered by submitting a r
     const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined);
     const readDroppedFile: ReadDroppedFile = vi.fn(async (candidatePath: string) =>
       candidatePath === "~/img.png"
-        ? { kind: "image", base64: "abc123", mediaType: "image/png", path: "/home/x/img.png" }
+        ? {
+            kind: "image" as const,
+            base64: "abc123",
+            mediaType: "image/png",
+            path: "/home/x/img.png",
+          }
         : undefined,
     );
     const { stdin } = renderApp(session, { readDroppedFile });
@@ -3421,7 +3491,7 @@ describe("App -- drop-file-to-attach (no keybinding; triggered by submitting a r
     const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined);
     const readDroppedFile: ReadDroppedFile = vi.fn(async (candidatePath: string) =>
       candidatePath === "/tmp/file.txt"
-        ? { kind: "text", content: "hello from file", path: "/tmp/file.txt" }
+        ? { kind: "text" as const, content: "hello from file", path: "/tmp/file.txt" }
         : undefined,
     );
     const { lastFrame, stdin } = renderApp(session, { readDroppedFile });

@@ -4,7 +4,13 @@
 // store, so packages/tui itself never imports @nanocode/ai or @nanocode/kernel directly
 // (context-graph.json's tui_isolation invariant) -- the same convention `RunShellCommand` and
 // `ModelSetupController` already follow.
-import type { AgentMessage, ModelOption, ProviderOption, Session } from "@nanocode/agent";
+import type {
+  AgentMessage,
+  ModelOption,
+  OAuthLoginHandlers,
+  ProviderOption,
+  Session,
+} from "@nanocode/agent";
 
 export interface SessionSummary {
   id: string;
@@ -17,6 +23,13 @@ export interface SlashCommandController {
   listProviders(): Promise<ProviderOption[]>;
   listModels(providerId: string): ModelOption[];
   login(providerId: string, apiKey: string): Promise<void>;
+  /** Drives a real, provider-sanctioned OAuth login mid-session -- see
+   * ModelSetupController.loginOAuth's own comment (setup-screen.tsx) for the full rationale; this
+   * is the same bridge, just reachable from "/login" instead of onboarding. */
+  loginOAuth(providerId: string, handlers: OAuthLoginHandlers): Promise<void>;
+  /** Best-effort opens a URL in the user's default browser -- see
+   * ModelSetupController.openUrl's own comment. */
+  openUrl(url: string): Promise<void>;
   logout(providerId: string): Promise<void>;
   /** Resolves `providerId`/`modelId` and reassigns it onto the running session's model in place,
    * preserving conversation history (see setup.ts's `switchModel`). */

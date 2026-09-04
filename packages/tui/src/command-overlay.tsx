@@ -8,6 +8,7 @@ import type { AgentMessage, ModelOption, ProviderOption } from "@nanocode/agent"
 import { Box, Text, useInput } from "ink";
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
 import React, { useEffect, useState } from "react";
+import { OAuthLoginFlow } from "./oauth-login.tsx";
 import { SelectList } from "./select-list.tsx";
 import { ApiKeyPrompt } from "./setup-screen.tsx";
 import {
@@ -27,8 +28,11 @@ interface Phase {
   step:
     | "loading"
     | "error"
+    | "login-method-choice"
     | "login-provider"
+    | "login-method"
     | "login-key"
+    | "login-oauth"
     | "login-ambient"
     | "model-provider"
     | "model-none-configured"
@@ -37,10 +41,29 @@ interface Phase {
     | "resume-pick"
     | "resume-empty";
   message?: string;
+  /** Which method "login-provider"'s own list was filtered to -- set only for that step, by
+   * `loadLoginProviders` below. */
+  authMethod?: "api-key" | "oauth";
   providers?: ProviderOption[];
   provider?: ProviderOption;
   models?: ModelOption[];
   sessions?: SessionSummary[];
+}
+
+/** Used ONLY by "/login &lt;exact-provider-id&gt;" (the arg-preselect path), which names a provider
+ * directly and so never goes through "login-method-choice"'s own upfront ask. A provider supporting
+ * BOTH interactive methods still asks which one first ("login-method"); one supporting only a
+ * single method (or neither, "login-ambient") skips straight past that choice. The no-arg browse
+ * path (`loadLoginProviders` below) never needs this: it asks the method FIRST, then only ever
+ * lists providers that already support it -- there's nothing left to disambiguate once a provider
+ * is selected from an already-filtered list. */
+function loginPhaseFor(provider: ProviderOption): Phase {
+  if (provider.supportsApiKeyLogin && provider.supportsOAuthLogin) {
+    return { step: "login-method", provider };
+  }
+  if (provider.supportsOAuthLogin) return { step: "login-oauth", provider };
+  if (provider.supportsApiKeyLogin) return { step: "login-key", provider };
+  return { step: "login-ambient", provider };
 }
 
 function describeError(error: unknown): string {
@@ -103,33 +126,33 @@ export function CommandOverlay({
         );
         return;
       }
-      // "login" and "model" both start from the provider list, but "/model" -- like pi's own --
-      // only ever offers to switch AMONG providers already configured (a real credential, or
-      // ambient ones like Bedrock/Vertex that resolve one automatically): adding a NEW provider is
-      // "/login"'s job, not "/model"'s. Filtering here means the picker only ever shows choices
-      // that will actually work, instead of listing everything and then erroring after the fact.
-      const providers = await controller.listProviders();
-      if (cancelled) return;
-
+      // "/login" with no arg asks which method first (see loadLoginProviders below) rather than
+      // fetching providers eagerly -- the method choice needs no provider data at all. "/login
+      // <exact-id>" already knows which provider it wants, so it still fetches immediately to
+      // resolve `arg` and decide (via loginPhaseFor) whether that ONE provider even needs asking.
+      if (kind === "login" && !arg) {
+        setPhase({ step: "login-method-choice" });
+        return;
+      }
       if (kind === "login") {
-        const preselected = arg ? providers.find((p) => p.id === arg) : undefined;
-        if (arg && !preselected) {
+        const providers = await controller.listProviders();
+        if (cancelled) return;
+        const preselected = providers.find((p) => p.id === arg);
+        if (!preselected) {
           setPhase({ step: "error", message: `Unknown provider "${arg}".` });
           return;
         }
-        if (preselected) {
-          setPhase(
-            preselected.supportsApiKeyLogin
-              ? { step: "login-key", provider: preselected }
-              : { step: "login-ambient", provider: preselected },
-          );
-        } else {
-          setPhase({ step: "login-provider", providers });
-        }
+        setPhase(loginPhaseFor(preselected));
         return;
       }
 
-      // kind === "model"
+      // kind === "model" -- like pi's own, only ever offers to switch AMONG providers already
+      // configured (a real credential, or ambient ones like Bedrock/Vertex that resolve one
+      // automatically): adding a NEW provider is "/login"'s job, not "/model"'s. Filtering here
+      // means the picker only ever shows choices that will actually work, instead of listing
+      // everything and then erroring after the fact.
+      const providers = await controller.listProviders();
+      if (cancelled) return;
       const configured = providers.filter((p) => p.hasCredential);
       const preselected = arg ? configured.find((p) => p.id === arg) : undefined;
       if (arg && !preselected) {
@@ -161,8 +184,34 @@ export function CommandOverlay({
     };
   }, []);
 
+  // "/login"'s own no-arg browse path: called once the user picks a method on "login-method-choice"
+  // -- mirrors setup-screen.tsx's own `loadProviders`. Filters to providers that actually support
+  // the CHOSEN method (`supportsApiKeyLogin`/`supportsOAuthLogin`), never `hasApiKeyAuth` alone --
+  // an ambient-only provider (Bedrock/Vertex: apiKey auth present, but nothing interactive to log
+  // in with) has no business appearing under either "API Key" or "OAuth" here. Naming a provider
+  // like that directly via "/login <its-id>" still works (loginPhaseFor's own "login-ambient"
+  // branch, above) -- only browsing loses it.
+  const loadLoginProviders = (authMethod: "api-key" | "oauth") => {
+    setPhase({ step: "loading" });
+    controller.listProviders().then(
+      (providers) => {
+        const filtered = providers.filter((provider) =>
+          authMethod === "oauth" ? provider.supportsOAuthLogin : provider.supportsApiKeyLogin,
+        );
+        setPhase({ step: "login-provider", authMethod, providers: filtered });
+      },
+      (error: unknown) => setPhase({ step: "error", message: describeError(error) }),
+    );
+  };
+
   useInput((input, key) => {
     if (key.escape) {
+      // "login-oauth" owns Escape itself -- OAuthLoginFlow's own useInput already aborts its
+      // in-flight login AND calls this same onCancel, so handling it here too would invoke
+      // onCancel twice for a single keypress (harmless with the current `atoms.overlay.set(
+      // undefined)` caller, but still a real double-fire this phase should own exclusively,
+      // matching the effort picker's own phase-gating below).
+      if (phase.step === "login-oauth") return;
       onCancel();
       return;
     }
@@ -221,25 +270,64 @@ export function CommandOverlay({
     );
   }
 
-  if (phase.step === "login-provider") {
+  if (phase.step === "login-method-choice") {
     return (
       <Box flexDirection="column">
-        <Text>Log in to which provider?</Text>
+        <Text>Log in how?</Text>
         <SelectList
-          items={(phase.providers ?? []).map((p) => ({
+          items={[
+            { id: "api-key", label: "API Key" },
+            { id: "oauth", label: "OAuth", sublabel: "sign in with a provider account" },
+          ]}
+          onSelect={(id) => loadLoginProviders(id === "oauth" ? "oauth" : "api-key")}
+        />
+      </Box>
+    );
+  }
+
+  if (phase.step === "login-provider") {
+    const authMethod = phase.authMethod ?? "api-key";
+    const providers = phase.providers ?? [];
+    return (
+      <Box flexDirection="column">
+        <Text>
+          {authMethod === "oauth" ? "Sign in with which provider?" : "Log in to which provider?"}
+        </Text>
+        <SelectList
+          items={providers.map((p) => ({
             id: p.id,
-            label: p.name,
+            label: authMethod === "oauth" ? (p.oauthName ?? p.name) : p.name,
             sublabel: p.hasCredential ? "configured" : undefined,
           }))}
           onSelect={(id) => {
-            const provider = (phase.providers ?? []).find((p) => p.id === id);
+            const provider = providers.find((p) => p.id === id);
             if (!provider) return;
             setPhase(
-              provider.supportsApiKeyLogin
-                ? { step: "login-key", provider }
-                : { step: "login-ambient", provider },
+              authMethod === "oauth"
+                ? { step: "login-oauth", provider }
+                : { step: "login-key", provider },
             );
           }}
+        />
+      </Box>
+    );
+  }
+
+  if (phase.step === "login-method" && phase.provider) {
+    const provider = phase.provider;
+    return (
+      <Box flexDirection="column">
+        <Text>Log in to {provider.name} how?</Text>
+        <SelectList
+          items={[
+            { id: "api-key", label: "API Key" },
+            { id: "oauth", label: provider.oauthName ?? "OAuth" },
+          ]}
+          onSelect={(id) =>
+            setPhase(
+              id === "oauth" ? { step: "login-oauth", provider } : { step: "login-key", provider },
+            )
+          }
         />
       </Box>
     );
@@ -259,6 +347,20 @@ export function CommandOverlay({
             setPhase({ step: "error", message: describeError(error) });
           }
         }}
+      />
+    );
+  }
+
+  if (phase.step === "login-oauth" && phase.provider) {
+    const provider = phase.provider;
+    return (
+      <OAuthLoginFlow
+        providerName={provider.oauthName ?? provider.name}
+        startLogin={(handlers) => controller.loginOAuth(provider.id, handlers)}
+        openUrl={controller.openUrl}
+        onSuccess={() => onDone({ kind: "message", text: `Logged in to ${provider.name}.` })}
+        onCancel={onCancel}
+        onError={(message) => setPhase({ step: "error", message })}
       />
     );
   }

@@ -599,3 +599,28 @@ export async function readDroppedFile(candidatePath: string): Promise<DroppedFil
     return undefined;
   }
 }
+
+/**
+ * OAuth's "auth_url" step's real work: best-effort opens `url` in the user's default browser, the
+ * same platform-launcher convention every other host integration in this file already uses
+ * (`clipboardCommand`, `readClipboardImage`). Never throws and never awaits the browser itself
+ * finishing anything -- only that the OS accepted the request to launch it. If it fails (no
+ * `xdg-open` on a minimal Linux box, a headless/SSH session with no browser at all), the login flow
+ * still works: the same URL is always ALSO shown as plain text (see the OAuth login UI), so the
+ * user can copy it manually.
+ */
+export async function openUrl(url: string): Promise<void> {
+  try {
+    if (process.platform === "darwin") {
+      await execFileAsync("open", [url]);
+    } else if (process.platform === "win32") {
+      // `start` is a cmd.exe builtin, not a real executable -- the empty "" is the window-title
+      // argument `start` expects before the URL when the target could itself look like a flag.
+      await execFileAsync("cmd", ["/c", "start", '""', url]);
+    } else {
+      await execFileAsync("xdg-open", [url]);
+    }
+  } catch {
+    // Best-effort -- the login flow's own UI always shows the same URL as plain text too.
+  }
+}

@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 import {
   listModelOptions,
   listProviderOptions,
+  loginWithOAuth,
+  type OAuthLoginHandlers,
   type Session,
   saveApiKey,
   TrustStore,
@@ -39,6 +41,7 @@ import {
   listRecentSessions,
   loadSessionMessages,
   type NanocodeSetup,
+  openUrl,
   readClipboardImage,
   readClipboardText,
   readDroppedFile,
@@ -89,6 +92,9 @@ async function main(): Promise<void> {
     listProviders: () => listProviderOptions(models),
     listModels: (providerId) => listModelOptions(models, providerId),
     login: (providerId, apiKey) => saveApiKey(models, providerId, apiKey),
+    loginOAuth: (providerId, handlers: OAuthLoginHandlers) =>
+      loginWithOAuth(models, providerId, handlers),
+    openUrl,
     finish: (providerId, modelId) => {
       const finishing = (async () => {
         const model = await resolveModel(models, { provider: providerId, model: modelId });
@@ -118,6 +124,9 @@ async function main(): Promise<void> {
     listProviders: () => listProviderOptions(models),
     listModels: (providerId) => listModelOptions(models, providerId),
     login: (providerId, apiKey) => saveApiKey(models, providerId, apiKey),
+    loginOAuth: (providerId, handlers: OAuthLoginHandlers) =>
+      loginWithOAuth(models, providerId, handlers),
+    openUrl,
     logout: (providerId) => credentials.delete(providerId),
     switchModel: (providerId, modelId) => {
       if (!runtime) throw new Error("no active session");

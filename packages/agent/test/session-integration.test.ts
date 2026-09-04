@@ -22,7 +22,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Session } from "../src/agent.ts";
 import { SessionLog } from "../src/session/log.ts";
-import type { AgentTool, StreamFn } from "../src/types.ts";
+import type { AgentMessage, AgentTool, StreamFn } from "../src/types.ts";
 
 const FAKE_MODEL: Model<Api> = {
   id: "fake-model",

@@ -2,11 +2,12 @@
 // session whenever App mounts without a Session yet. All state here is local via plain useState --
 // nothing outside this component ever needs to read it, unlike the atom-backed state in app.tsx,
 // so there's no reason to route it through an atom.
-import type { ModelOption, ProviderOption, Session } from "@nanocode/agent";
-import { Box, Text, useInput } from "ink";
+import type { ModelOption, OAuthLoginHandlers, ProviderOption, Session } from "@nanocode/agent";
+import { Box, Text } from "ink";
 import TextInput from "ink-text-input";
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
 import React, { useState } from "react";
+import { OAuthLoginFlow } from "./oauth-login.tsx";
 import { SelectList } from "./select-list.tsx";
 
 /** packages/cli/src/tui.tsx implements this, closing over the real MutableModels/resolveModel it
@@ -15,6 +16,14 @@ export interface ModelSetupController {
   listProviders(): Promise<ProviderOption[]>;
   listModels(providerId: string): ModelOption[];
   login(providerId: string, apiKey: string): Promise<void>;
+  /** Drives a real, provider-sanctioned OAuth login (see ProviderOption.supportsOAuthLogin's own
+   * comment) -- `handlers` is this component's own bridge between pi-ai's generic prompt/notify
+   * interaction protocol and whatever UI is actually showing it (see oauth-login.tsx). */
+  loginOAuth(providerId: string, handlers: OAuthLoginHandlers): Promise<void>;
+  /** Best-effort opens a URL in the user's default browser -- an "auth_url" OAuth event's own real
+   * work. Never rejects: the same URL is always ALSO shown as plain text, so a failure here (no
+   * browser available, e.g. over SSH) never blocks the login flow, only loses the convenience. */
+  openUrl(url: string): Promise<void>;
   /** Resolves the chosen model AND builds the full session runtime (kernel, telemetry, MCP) --
    * one step, so this component only ever hands App a fully-ready Session, never a partial one. */
   finish(providerId: string, modelId: string): Promise<Session>;
@@ -22,11 +31,11 @@ export interface ModelSetupController {
 
 type SetupPhase =
   | { step: "choose-auth-method" }
-  | { step: "oauth-unavailable" }
   | { step: "loading" }
-  | { step: "choose-provider"; providers: ProviderOption[] }
+  | { step: "choose-provider"; authMethod: "api-key" | "oauth"; providers: ProviderOption[] }
   | { step: "enter-key"; provider: ProviderOption }
   | { step: "saving-key"; provider: ProviderOption }
+  | { step: "oauth-login"; provider: ProviderOption }
   | { step: "choose-model"; provider: ProviderOption; models: ModelOption[] }
   | { step: "starting" }
   | { step: "error"; message: string };
@@ -43,15 +52,25 @@ export function SetupScreen({
   onReady: (session: Session) => void;
 }) {
   // Starts on the auth-method choice, matching pi's own /login flow (which also asks OAuth vs.
-  // API key first) -- OAuth is listed but not selectable yet (ADR 0004 declined it outright for
-  // nanocode, no path back to reconsidering it here). listProviders() only runs once the user
-  // actually picks "API Key," not eagerly on mount.
+  // API key first). OAuth now offers every provider with a real, provider-sanctioned OAuth login
+  // (pi-ai's own bundled implementations -- e.g. Anthropic's Claude Pro/Max, GitHub Copilot) --
+  // listProviders() only runs once an auth method is actually picked, not eagerly on mount.
   const [phase, setPhase] = useState<SetupPhase>({ step: "choose-auth-method" });
 
-  const loadProviders = () => {
+  const loadProviders = (authMethod: "api-key" | "oauth") => {
     setPhase({ step: "loading" });
     setup.listProviders().then(
-      (providers) => setPhase({ step: "choose-provider", providers }),
+      (providers) => {
+        // Filtered to providers that actually support the CHOSEN method -- never `hasApiKeyAuth`
+        // alone, which also includes ambient-only providers (Bedrock/Vertex: env var / cloud
+        // profile resolution, nothing interactive to log in with). Onboarding asks "API Key" or
+        // "OAuth" specifically, so only providers offering one of those two real login paths belong
+        // in either list; an ambient-only provider has no path through this screen right now.
+        const filtered = providers.filter((provider) =>
+          authMethod === "oauth" ? provider.supportsOAuthLogin : provider.supportsApiKeyLogin,
+        );
+        setPhase({ step: "choose-provider", authMethod, providers: filtered });
+      },
       (error: unknown) => setPhase({ step: "error", message: describeError(error) }),
     );
   };
@@ -63,23 +82,11 @@ export function SetupScreen({
         <SelectList
           items={[
             { id: "api-key", label: "API Key" },
-            { id: "oauth", label: "OAuth", sublabel: "not yet available" },
+            { id: "oauth", label: "OAuth", sublabel: "sign in with a provider account" },
           ]}
-          onSelect={(id) => {
-            if (id === "oauth") {
-              setPhase({ step: "oauth-unavailable" });
-            } else {
-              loadProviders();
-            }
-          }}
+          onSelect={(id) => loadProviders(id === "oauth" ? "oauth" : "api-key")}
         />
       </Box>
-    );
-  }
-
-  if (phase.step === "oauth-unavailable") {
-    return (
-      <OAuthUnavailableNotice onAcknowledge={() => setPhase({ step: "choose-auth-method" })} />
     );
   }
 
@@ -92,23 +99,29 @@ export function SetupScreen({
   }
 
   if (phase.step === "choose-provider") {
+    const { authMethod, providers } = phase;
     return (
       <Box flexDirection="column">
-        <Text>No model configured yet -- choose a provider:</Text>
+        <Text>
+          {authMethod === "oauth"
+            ? "Sign in with which provider?"
+            : "No model configured yet -- choose a provider:"}
+        </Text>
         <SelectList
-          items={phase.providers.map((provider) => ({
+          items={providers.map((provider) => ({
             id: provider.id,
-            label: provider.name,
-            sublabel: provider.hasCredential
-              ? "configured"
-              : provider.supportsApiKeyLogin
-                ? undefined
-                : "ambient credentials only",
+            label: authMethod === "oauth" ? (provider.oauthName ?? provider.name) : provider.name,
+            sublabel: provider.hasCredential ? "configured" : undefined,
           }))}
           onSelect={(providerId) => {
-            const provider = phase.providers.find((p) => p.id === providerId);
+            const provider = providers.find((p) => p.id === providerId);
             if (!provider) return;
-            if (provider.hasCredential || !provider.supportsApiKeyLogin) {
+            if (authMethod === "oauth") {
+              setPhase({ step: "oauth-login", provider });
+            } else if (provider.hasCredential) {
+              // Already has a working API key (env var or previously saved) -- no need to ask for
+              // it again, straight to model choice, matching the OAuth branch's own "already
+              // signed in" shortcut one line up.
               setPhase({
                 step: "choose-model",
                 provider,
@@ -120,6 +133,22 @@ export function SetupScreen({
           }}
         />
       </Box>
+    );
+  }
+
+  if (phase.step === "oauth-login") {
+    const provider = phase.provider;
+    return (
+      <OAuthLoginFlow
+        providerName={provider.oauthName ?? provider.name}
+        startLogin={(handlers) => setup.loginOAuth(provider.id, handlers)}
+        openUrl={setup.openUrl}
+        onSuccess={() =>
+          setPhase({ step: "choose-model", provider, models: setup.listModels(provider.id) })
+        }
+        onCancel={() => loadProviders("oauth")}
+        onError={(message) => setPhase({ step: "error", message })}
+      />
     );
   }
 
@@ -176,21 +205,6 @@ export function SetupScreen({
 
   // phase.step === "starting"
   return <Text color="gray">Starting session…</Text>;
-}
-
-function OAuthUnavailableNotice({ onAcknowledge }: { onAcknowledge: () => void }) {
-  useInput(() => {
-    onAcknowledge();
-  });
-  return (
-    <Box flexDirection="column">
-      <Text color="yellow">
-        OAuth isn't supported yet in nanocode -- API keys only
-        (decisions/0004-auth-no-stealth-mode.md).
-      </Text>
-      <Text dimColor>Press any key to go back and choose API Key instead.</Text>
-    </Box>
-  );
 }
 
 /** Exported for command-overlay.tsx's "/login" flow, which needs the exact same masked text-entry

@@ -96,7 +96,11 @@ describe("buildTranscriptItems", () => {
         { type: "toolCall", id: "call-1", name: "ipython", arguments: { code: "print(1)" } },
       ],
       timestamp: 1000,
-    } as AgentMessage;
+      // A single-toolCall-block content array's `type` widens to `string`, which no longer
+      // "sufficiently overlaps" AssistantMessage's own discriminated union -- `as unknown` first is
+      // TS's own suggested fix for a literal fixture that intentionally omits every other real
+      // AssistantMessage field (api/provider/model/usage/stopReason) this test never reads.
+    } as unknown as AgentMessage;
     const resultMessage = {
       role: "toolResult",
       toolCallId: "call-1",
@@ -122,7 +126,7 @@ describe("buildTranscriptItems", () => {
       role: "assistant",
       content: [{ type: "toolCall", id: "call-3", name: "ipython", arguments: { code: "1" } }],
       timestamp: 1,
-    } as AgentMessage;
+    } as unknown as AgentMessage;
     const resultMessage = {
       role: "toolResult",
       toolCallId: "call-3",
@@ -152,7 +156,7 @@ describe("buildTranscriptItems", () => {
         { type: "toolCall", id: "call-2", name: "ipython", arguments: { code: "print(2)" } },
       ],
       timestamp: 1000,
-    } as AgentMessage;
+    } as unknown as AgentMessage;
 
     const items = buildTranscriptItems([callMessage], false);
     expect(items).toEqual([]);
@@ -235,7 +239,7 @@ describe("buildTranscriptItems", () => {
       content: [],
       errorMessage: "boom",
       timestamp: 1,
-    } as AgentMessage;
+    } as unknown as AgentMessage;
 
     const items = buildTranscriptItems([message], false);
     expect(items).toHaveLength(1);
