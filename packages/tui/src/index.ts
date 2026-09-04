@@ -9,6 +9,14 @@ export {
 export { type Atom, atom, useAtom } from "./atom.ts";
 export { type BackpressureQueue, createBackpressureQueue } from "./backpressure.ts";
 export { StartupBanner } from "./banner.tsx";
+export {
+  MOUSE_DISABLE_SEQUENCE,
+  MOUSE_ENABLE_SEQUENCE,
+  type MouseAwareStdin,
+  onWheel,
+  type WheelDirection,
+  wrapStdinForMouse,
+} from "./mouse.ts";
 export { HorizontalRule, StatusBar, type StatusBarProps } from "./status-bar.tsx";
 export {
   buildTranscriptItems,

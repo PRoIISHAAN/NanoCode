@@ -2,7 +2,8 @@
 // end) and shows the settled message afterward -- against a REAL Session driven by a fake
 // EventStream, the same pattern packages/agent's own tests use, rather than a hand-rolled fake
 // event list that might not match what Session actually emits.
-import type { AgentTool } from "@nanocode/agent";
+import { EventEmitter } from "node:events";
+import type { AgentMessage, AgentTool } from "@nanocode/agent";
 import { Session } from "@nanocode/agent";
 import type {
   Api,
@@ -15,6 +16,7 @@ import { EventStream } from "@nanocode/ai";
 import { render } from "ink-testing-library";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
+import wrapAnsi from "wrap-ansi";
 import {
   App,
   type ReadClipboardImage,
@@ -23,6 +25,8 @@ import {
   type RunShellCommand,
   type SpawnEditor,
 } from "../src/app.tsx";
+import { MENU_WINDOW_SIZE } from "../src/command-menu.tsx";
+import { wrapStdinForMouse } from "../src/mouse.ts";
 import type { ModelSetupController } from "../src/setup-screen.tsx";
 import {
   SLASH_COMMANDS,
@@ -230,7 +234,7 @@ describe("App", () => {
       initialState: { model: FAKE_MODEL, systemPrompt: "test" },
     });
 
-    const { lastFrame } = render(
+    const { lastFrame, stdin } = render(
       <App
         session={session}
         setup={NEVER_CALLED_SETUP}
@@ -245,10 +249,19 @@ describe("App", () => {
       />,
     );
 
-    // Drives the session directly rather than through ink-text-input's own keystroke simulation --
-    // what this test actually needs to prove is App's event-subscription -> render pipeline, not
-    // ink-text-input's (separately-tested, third-party) raw-mode keypress handling.
-    void session.prompt("hello");
+    // Submitted through the same real stdin/Enter path `PromptInput` itself uses (not a direct
+    // `session.prompt()` call, an earlier version of this test did that) -- `atoms.busy` is only
+    // ever flipped true by that submit path, never by the session's own event stream, and
+    // `NotificationLine`'s fixed-status text is now gated on `busy` (see its own comment on why:
+    // a real, reported bug had the SAME status text rendered twice, once here correctly gated and
+    // once unconditionally inline in the transcript -- the fix removed the ungated duplicate, which
+    // means a direct `session.prompt()` call bypassing `busy` entirely would now show nothing at all
+    // here, a test-only gap rather than anything wrong with the app itself).
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
     await wait(10);
 
     stream.push({
@@ -542,17 +555,21 @@ describe("App", () => {
     expect(cwdIndex).toBeGreaterThan(promptIndex + 1);
   });
 
-  it("Ctrl+O only expands tool cells created after the toggle -- an already-settled cell stays frozen", async () => {
+  it("Ctrl+O retroactively expands EVERY tool cell, already-settled ones included -- not just future ones -- and is fully reversible", async () => {
     // Drives a real toolCall -> real tool execution -> real toolResult message round-trip (the
     // same shape packages/agent/test/agent.test.ts's own fake-tool tests use), rather than
     // fabricating a toolResult message directly -- that would only prove the collapse renderer
     // works on hand-shaped data, not that it's wired to a genuinely produced message.
     //
-    // Under <Static>, a tool cell's render is frozen the first time it settles -- ctrl+o can no
-    // longer retroactively repaint it (see transcript.tsx's own header comment). So this test runs
-    // TWO tool-call round trips: the first settles collapsed under the default toggle state and
-    // must stay that way even after ctrl+o is pressed; the second is created AFTER the toggle and
-    // must render expanded from the moment it appears, with no further toggle needed.
+    // Now that nothing freezes into permanent `<Static>` scrollback, `toolOutputExpanded` is a
+    // single GLOBAL toggle applied uniformly to every item on every render (see transcript.tsx's
+    // own `TranscriptProps.toolOutputExpanded` doc comment) -- unlike the old `<Static>`-based
+    // version, ctrl+o now retroactively re-renders an ALREADY-settled cell too, not just ones
+    // created after the toggle. Kept to a single tool-call round trip (rather than two, as an
+    // earlier version of this test did): this app's fixed-height transcript viewport (see
+    // transcript.tsx's own header comment) would clip the FIRST round trip off-screen entirely
+    // once a second one pushed the conversation past this harness's small simulated terminal
+    // height, which would make this test about clipping instead of about the toggle itself.
     const multiLineTool: AgentTool = {
       name: "multiline-tool",
       label: "Multiline",
@@ -564,24 +581,19 @@ describe("App", () => {
       }),
     };
 
-    // Each session.prompt() round-trips the ConversationDriver loop until stopReason "stop" --
-    // one prompt() call always drives streamFn twice (a toolUse turn, then a stop turn), matching
-    // this file's other multi-turn fake-stream tests (see `call` counters elsewhere in this file).
-    // Odd calls emit the toolCall (a fresh id per round so each becomes its own transcript item),
-    // even calls emit the final "done" text that settles the turn.
+    // One prompt() call drives streamFn twice (a toolUse turn, then a stop turn) -- matching this
+    // file's other multi-turn fake-stream tests.
     let call = 0;
     const session = new Session({
       streamFn: () => {
         call += 1;
         const stream = fakeStream();
-        if (call % 2 === 1) {
+        if (call === 1) {
           stream.push({
             type: "done",
             reason: "toolUse",
             message: assistantMessage({
-              content: [
-                { type: "toolCall", id: `call-${call}`, name: "multiline-tool", arguments: {} },
-              ],
+              content: [{ type: "toolCall", id: "call-1", name: "multiline-tool", arguments: {} }],
               stopReason: "toolUse",
             }),
           });
@@ -617,7 +629,7 @@ describe("App", () => {
     await session.prompt("run something");
     await wait(20);
 
-    // First cell settles under the default toolOutputExpanded=false: no output lines at all, just
+    // The cell settles under the default toolOutputExpanded=false: no output lines at all, just
     // the one-line summary. This tool has no `code` (empty `arguments: {}`), so the summary is
     // marker + language + line counts + expand hint.
     let frame = lastFrame() ?? "";
@@ -627,29 +639,24 @@ describe("App", () => {
     expect(frame).not.toContain("line two");
     expect(frame).not.toContain("line three");
 
-    stdin.write("\x0F"); // Ctrl+O -- toggles the live toggle for FUTURE items only.
+    stdin.write("\x0F"); // Ctrl+O -- a global toggle, retroactively affecting this already-settled cell.
     await wait(10);
 
-    await session.prompt("run something again");
-    await wait(20);
-
     frame = lastFrame() ?? "";
-    // Both cells' summary lines mention "multiline-tool" -- pick them out in transcript order so
-    // each cell's own hint can be checked independently of the other.
-    const toolLines = frame.split("\n").filter((line) => line.includes("multiline-tool"));
-    expect(toolLines).toHaveLength(2);
-    // The FIRST cell (already settled before the toggle) is unchanged: still collapsed. This is
-    // the single most important assertion in this test -- it proves ctrl+o did not retroactively
-    // repaint already-frozen Static output.
-    expect(toolLines[0]).toContain("ctrl+o to expand");
-    // The SECOND cell (created after the toggle) renders expanded from the moment it appears, with
-    // no need to toggle again.
-    expect(toolLines[1]).toContain("ctrl+o to collapse");
-    // The full output appears exactly once -- only for the second, expanded cell.
-    expect(frame.match(/line one/g)).toHaveLength(1);
+    expect(frame).toContain("ctrl+o to collapse");
+    expect(frame).not.toContain("ctrl+o to expand");
+    expect(frame).toContain("line one");
     expect(frame).toContain("line two");
     expect(frame).toContain("line three");
     expect(frame).not.toContain("waiting for code");
+
+    stdin.write("\x0F"); // toggle back off -- proves this is a live, reversible toggle, not a one-way reveal.
+    await wait(10);
+
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("ctrl+o to expand");
+    expect(frame).not.toContain("ctrl+o to collapse");
+    expect(frame).not.toContain("line one");
   });
 
   it("Ctrl+O does not leak a literal 'o' into text being composed in the prompt box", async () => {
@@ -768,6 +775,248 @@ describe("App", () => {
     });
     await wait(20);
     expect(lastFrame()).toContain("hi there");
+  });
+});
+
+// The old `FillerSpace` component (which used to be rendered right after `<TranscriptView>` in
+// `RunningSession`, padding a fresh/empty launch out to the full terminal height with blank lines)
+// is GONE -- it was superseded by the current architecture, where `Transcript` (transcript.tsx)
+// itself is a FIXED-height, clipped viewport (see its own header comment) and `TranscriptView`
+// (app.tsx) computes that height as `rows - footerHeight`, always exactly filling whatever the rest
+// of the screen (`NotificationLine` + the two rules + the prompt box/overlay + the "/" menu + the
+// status bar) doesn't use. On a fresh, empty launch, `Transcript`'s own `topAligned` layout (see
+// transcript.tsx) puts the banner at the TOP of that fixed-height box and leaves the rest of the
+// box's own height as blank space below it -- the same visual effect `FillerSpace` used to produce
+// by hand, just now an emergent property of `Transcript`'s own fixed-height box rather than a
+// separate component reasoning about "how much filler is left."
+//
+// `ink-testing-library`'s fake `Stdout` class (node_modules/ink-testing-library/build/index.js,
+// read directly to confirm this) defines only a fixed `columns` getter (100, already relied on
+// elsewhere in this file) and NO `rows` property or getter at all -- so `useStdout().stdout.rows` is
+// always `undefined` in this harness (confirmed live: logging it inside a throwaway render prints
+// `undefined`). `RunningSession`'s own root `<Box height={stdout?.rows ?? 24}>` falls back to a
+// fixed `24` whenever `stdout.rows` is nullish, so every test in this file renders against a
+// deterministic 24-row simulated terminal.
+//
+// There is no documented way to control `ink-testing-library`'s simulated `rows` value -- its own
+// `render(tree)` takes no options at all (confirmed by reading its source above), unlike `columns`,
+// which is likewise fixed but at least discoverable the same way. Since there's no way to shrink the
+// simulated terminal below the banner's own 9 rows (`BANNER_ROWS`) through this harness's public
+// API, the "does not crash on a terminal smaller than the banner" case is skipped here rather than
+// faked; `Math.max(1, ...)` in `TranscriptView`'s own `transcriptHeight` computation already guards
+// that path (see app.tsx), and every other test in this file already exercises this exact fixed
+// 24-row terminal without ever crashing.
+//
+// Note on `isFullscreen`/the trailing-newline mechanism itself: `ink-testing-library`'s `render()`
+// (its source, read directly above) always passes `debug: true` to Ink's own `render()`. Reading
+// `ink/build/ink.js`'s `onRender` shows `debug: true` takes an entirely separate, EARLIER branch
+// (`if (this.options.debug) { ...; this.options.stdout.write(this.fullStaticOutput + output); return; }`)
+// that returns before ever reaching `renderInteractiveFrame` -- the method that contains the real
+// `isFullscreen`/`outputHeight >= viewportRows` check and the trailing-"\n" decision this whole
+// feature relies on. In other words, this harness NEVER exercises that code path at all, in either
+// direction: it never appends a trailing "\n" regardless of fullscreen state, and it never even calls
+// `getWindowSize` for `rows` (only a couple of unrelated `columns` reads elsewhere touch that
+// function). So there is no way, through this harness's public API, to directly observe whether the
+// real trailing-newline-omission fired -- see the dedicated test below, which instead asserts the
+// structural precondition (`outputHeight >= viewportRows`) that the real, non-debug Ink runtime uses
+// to decide this, since that's the closest thing to "did the fullscreen path get taken" this harness
+// can actually see. This mechanism doesn't depend on `FillerSpace` at all (it never did -- it comes
+// from Ink's own runtime, `tui.tsx`'s alternate-screen-buffer entry, and the fixed root `height`),
+// so it's kept here even though the rest of this describe block's old FillerSpace-specific
+// assertions are not.
+describe("App -- fixed full-terminal layout (footer pinned, transcript fills the rest)", () => {
+  /** The banner (`StartupBanner`, banner.tsx) is a round-bordered box -- "╰" only ever appears on its
+   * own closing border line, nowhere else in this app (confirmed via the banner being the only
+   * `borderStyle` user in the whole codebase, same fact `hasExited` below in this file already relies
+   * on), so it's a stable way to find the last row the banner itself occupies. */
+  const findBannerEndIndex = (lines: string[]) => lines.findIndex((line) => line.includes("╰"));
+  /** Same technique the "frames the prompt box with a horizontal rule" test above already uses: a
+   * pure run of "─" (no corner characters mixed in, unlike the banner's own border) only ever comes
+   * from `HorizontalRule` (status-bar.tsx), and the first one in the frame is always the rule directly
+   * above the prompt box. */
+  const findFirstRuleIndex = (lines: string[]) => lines.findIndex((line) => /^─+$/.test(line));
+  const SIMULATED_TERMINAL_ROWS = 24; // this describe block's own header comment establishes this
+
+  /** The total rendered line count never changes regardless of how much real conversation content
+   * exists -- `TranscriptView`'s own `transcriptHeight = rows - footerHeight` computation keeps the
+   * live tree exactly `rows` tall at all times (this is the direct replacement for what the old,
+   * now-removed `FillerSpace` component used to achieve by hand): as real content grows, blank rows
+   * inside `Transcript`'s own fixed-height box shrink to make room, they never change the total. */
+  const totalRenderedLines = (frame: string) => {
+    const rawLines = frame.split("\n");
+    return rawLines.length > 0 && rawLines[rawLines.length - 1] === ""
+      ? rawLines.length - 1
+      : rawLines.length;
+  };
+
+  it("renders exactly `rows` (24) lines on a fresh, empty launch, banner top-aligned with blank space below it inside the transcript's own fixed-height box", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame } = render(
+      <App
+        session={session}
+        setup={NEVER_CALLED_SETUP}
+        version="1.0.0"
+        cwd="/test"
+        runShellCommand={NEVER_CALLED_RUN_SHELL_COMMAND}
+        slashCommands={NEVER_CALLED_SLASH_COMMANDS}
+        spawnEditor={NEVER_CALLED_SPAWN_EDITOR}
+        readClipboardImage={NEVER_CALLED_READ_CLIPBOARD_IMAGE}
+        readClipboardText={NEVER_CALLED_READ_CLIPBOARD_TEXT}
+        readDroppedFile={DEFAULT_READ_DROPPED_FILE}
+      />,
+    );
+    await wait(20);
+
+    const frame = lastFrame() ?? "";
+    expect(totalRenderedLines(frame)).toBe(SIMULATED_TERMINAL_ROWS);
+
+    const lines = frame.split("\n");
+    const bannerEndIndex = findBannerEndIndex(lines);
+    const ruleIndex = findFirstRuleIndex(lines);
+    expect(bannerEndIndex).toBeGreaterThan(-1);
+    expect(ruleIndex).toBeGreaterThan(bannerEndIndex);
+
+    // Every row between the banner's own closing border and the rule above the prompt box is blank
+    // on a totally fresh launch (topAligned: banner at the top, nothing else in the conversation
+    // yet) -- confirmed directly against a live render, not hand-derived purely from the layout
+    // formula, since that's exactly the kind of arithmetic this file has gotten wrong before.
+    const between = lines.slice(bannerEndIndex + 1, ruleIndex);
+    for (const line of between) expect(line.trim()).toBe("");
+    expect(between.length).toBeGreaterThan(0);
+  });
+
+  it("still renders exactly `rows` (24) lines once a real message settles into the transcript (messagesAtom) -- the blank space shrinks, the total never does", async () => {
+    const stream = fakeStream();
+    const session = new Session({
+      streamFn: () => stream,
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame } = render(
+      <App
+        session={session}
+        setup={NEVER_CALLED_SETUP}
+        version="1.0.0"
+        cwd="/test"
+        runShellCommand={NEVER_CALLED_RUN_SHELL_COMMAND}
+        slashCommands={NEVER_CALLED_SLASH_COMMANDS}
+        spawnEditor={NEVER_CALLED_SPAWN_EDITOR}
+        readClipboardImage={NEVER_CALLED_READ_CLIPBOARD_IMAGE}
+        readClipboardText={NEVER_CALLED_READ_CLIPBOARD_TEXT}
+        readDroppedFile={DEFAULT_READ_DROPPED_FILE}
+      />,
+    );
+
+    void session.prompt("hello");
+    await wait(10);
+    stream.push({
+      type: "done",
+      reason: "stop",
+      message: assistantMessage({
+        content: [{ type: "text", text: "hi there" }],
+        stopReason: "stop",
+      }),
+    });
+    await wait(20);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("hello");
+    expect(frame).toContain("hi there");
+    expect(totalRenderedLines(frame)).toBe(SIMULATED_TERMINAL_ROWS);
+  });
+
+  it("still renders exactly `rows` (24) lines once a local entry exists (a '!!command', going through localEntriesAtom rather than messagesAtom)", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const runShellCommand: RunShellCommand = vi.fn(async (command: string) => ({
+      output: `ran: ${command}`,
+      isError: false,
+    }));
+    const { lastFrame, stdin } = render(
+      <App
+        session={session}
+        setup={NEVER_CALLED_SETUP}
+        version="1.0.0"
+        cwd="/test"
+        runShellCommand={runShellCommand}
+        slashCommands={NEVER_CALLED_SLASH_COMMANDS}
+        spawnEditor={NEVER_CALLED_SPAWN_EDITOR}
+        readClipboardImage={NEVER_CALLED_READ_CLIPBOARD_IMAGE}
+        readClipboardText={NEVER_CALLED_READ_CLIPBOARD_TEXT}
+        readDroppedFile={DEFAULT_READ_DROPPED_FILE}
+      />,
+    );
+
+    for (const ch of "!!echo hi") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+
+    expect(session.state.messages).toHaveLength(0); // went through localEntriesAtom, not messagesAtom
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("echo hi");
+    expect(totalRenderedLines(frame)).toBe(SIMULATED_TERMINAL_ROWS);
+  });
+
+  it("the live tree's own rendered height reaches (at least) the harness's simulated row count on a fresh, empty launch -- the structural precondition Ink's real isFullscreen check relies on to omit its trailing newline", async () => {
+    // This is the direct regression test for the actual mechanism this whole feature depends on:
+    // Ink's own `renderInteractiveFrame` (ink/build/ink.js) only omits the trailing "\n" it would
+    // otherwise unconditionally append after a live frame when `outputHeight >= viewportRows` (its
+    // own `isFullscreen` check). As established in this describe block's own header comment,
+    // `ink-testing-library`'s `render()` always runs Ink in `debug: true` mode, which takes an
+    // earlier, separate branch in `onRender` that never reaches `renderInteractiveFrame` at all --
+    // so there is no way, through this harness's public API (`lastFrame()`, `frames`, or anything
+    // else `node_modules/ink-testing-library/build/index.js` actually exports), to directly observe
+    // whether a trailing "\n" was appended or omitted; debug mode never appends one either way. That
+    // was confirmed by reading both files directly, not assumed.
+    //
+    // Falling back, as the task allows, to asserting the STRUCTURAL claim the real (non-debug)
+    // mechanism depends on instead: that the combined live tree on a fresh, empty launch (banner +
+    // filler + rule/prompt/rule/status) actually renders at least as many lines as the harness's own
+    // simulated terminal height (24, per this describe block's header comment) -- i.e.
+    // `outputHeight >= viewportRows` really would hold here, which is the exact condition
+    // `isFullscreen` checks in the real runtime. If this ever regressed back to staying under `rows`
+    // (e.g. someone reintroducing a "leave a safety row" subtraction), Ink would go back to always
+    // appending its trailing "\n" on a real terminal even on a totally empty launch, reproducing the
+    // original "banner's own top row scrolls off-screen" bug this whole rework fixed.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame } = render(
+      <App
+        session={session}
+        setup={NEVER_CALLED_SETUP}
+        version="1.0.0"
+        cwd="/test"
+        runShellCommand={NEVER_CALLED_RUN_SHELL_COMMAND}
+        slashCommands={NEVER_CALLED_SLASH_COMMANDS}
+        spawnEditor={NEVER_CALLED_SPAWN_EDITOR}
+        readClipboardImage={NEVER_CALLED_READ_CLIPBOARD_IMAGE}
+        readClipboardText={NEVER_CALLED_READ_CLIPBOARD_TEXT}
+        readDroppedFile={DEFAULT_READ_DROPPED_FILE}
+      />,
+    );
+    await wait(20);
+
+    const frame = lastFrame() ?? "";
+    // A frame ending in "\n" would otherwise contribute one spurious trailing empty entry to
+    // `split("\n")` that was never a real rendered row -- trimmed off so this counts actual lines
+    // only, matching how `viewportRows`/`outputHeight` are both real row counts in Ink's own code.
+    const rawLines = frame.split("\n");
+    const renderedLineCount =
+      rawLines.length > 0 && rawLines[rawLines.length - 1] === ""
+        ? rawLines.length - 1
+        : rawLines.length;
+
+    const SIMULATED_TERMINAL_ROWS = 24; // this describe block's own header comment establishes this
+    expect(renderedLineCount).toBeGreaterThanOrEqual(SIMULATED_TERMINAL_ROWS);
   });
 });
 
@@ -1010,12 +1259,14 @@ describe("App -- '!command' bash escape", () => {
     expect(frame).not.toContain("… "); // busy was cleared, same as a failed chat prompt
   });
 
-  it("ctrl+o only affects bang-command tool cells created after the toggle, not ones already settled", async () => {
-    // Same "already-frozen cells don't retroactively repaint" behavior proven for real tool calls
-    // above, here for the synthetic toolResult entry a bang command produces (buildBangCommandEntries
-    // in app.tsx) -- it goes through the same ToolCellItem/<Static> path. Runs TWO bang commands with
-    // distinct command text so each becomes its own transcript item that can be told apart in the
-    // rendered frame.
+  it("ctrl+o retroactively expands an already-settled bang-command tool cell too, same as a real tool call", async () => {
+    // Same global, retroactive `toolOutputExpanded` contract proven for real tool calls above, here
+    // for the synthetic toolResult entry a bang command produces (buildBangCommandEntries in
+    // app.tsx) -- it goes through the same ToolCellItem rendering path (transcript.tsx). Kept to a
+    // single bang command (rather than two, as an earlier version of this test did): this app's
+    // fixed-height transcript viewport would clip the first one off-screen entirely once a second
+    // command's own output pushed the conversation past this harness's small simulated terminal
+    // height, which would make this test about clipping rather than about the toggle itself.
     const session = new Session({
       streamFn: () => fakeStream(),
       initialState: { model: FAKE_MODEL, systemPrompt: "test" },
@@ -1046,8 +1297,8 @@ describe("App -- '!command' bash escape", () => {
     stdin.write("\r");
     await wait(20);
 
-    // First cell settles under the default toolOutputExpanded=false: no output lines at all --
-    // just the one-line summary (language "shell" + the command itself as the code preview).
+    // The cell settles under the default toolOutputExpanded=false: no output lines at all -- just
+    // the one-line summary (language "shell" + the command itself as the code preview).
     let frame = lastFrame() ?? "";
     expect(frame).toContain("shell");
     expect(frame).toContain("cat file");
@@ -1056,31 +1307,12 @@ describe("App -- '!command' bash escape", () => {
     expect(frame).not.toContain("line two");
     expect(frame).not.toContain("line three");
 
-    stdin.write("\x0F"); // Ctrl+O -- toggles the live toggle for FUTURE items only.
+    stdin.write("\x0F"); // Ctrl+O -- a global toggle, retroactively affecting this already-settled cell.
     await wait(10);
 
-    for (const ch of "!cat file2") {
-      stdin.write(ch);
-      await wait(5);
-    }
-    stdin.write("\r");
-    await wait(20);
-
     frame = lastFrame() ?? "";
-    const lines = frame.split("\n");
-    // "cat file2" contains "cat file" as a substring, so the first cell's own line is picked out by
-    // excluding any line that also mentions "cat file2".
-    const firstCellLines = lines.filter(
-      (line) => line.includes("cat file") && !line.includes("cat file2"),
-    );
-    const secondCellLines = lines.filter((line) => line.includes("cat file2"));
-    expect(firstCellLines.length).toBeGreaterThan(0);
-    expect(secondCellLines.length).toBeGreaterThan(0);
-    // The FIRST cell (already settled before the toggle) is unchanged: still collapsed. This is
-    // the key assertion -- it proves ctrl+o did not retroactively repaint already-frozen output.
-    expect(firstCellLines.some((line) => line.includes("ctrl+o to expand"))).toBe(true);
-    // The SECOND cell (created after the toggle) renders expanded from the moment it appears.
-    expect(secondCellLines.some((line) => line.includes("ctrl+o to collapse"))).toBe(true);
+    expect(frame).toContain("ctrl+o to collapse");
+    expect(frame).not.toContain("ctrl+o to expand");
     expect(frame).toContain("line one");
     expect(frame).toContain("line two");
     expect(frame).toContain("line three");
@@ -1103,7 +1335,21 @@ const MODEL_TWO: Model<Api> = {
 };
 
 describe("App -- '/command' dispatch", () => {
-  it("/help lists every command's usage and description", async () => {
+  it("/help pushes a notice with every command's usage and description (verified against the real, exhaustive slash-commands.test.ts unit test), dispatching it into the fixed-height transcript", async () => {
+    // `helpText()` itself (slash-commands.ts) is already exhaustively unit-tested in
+    // slash-commands.test.ts -- every command's usage/description is asserted to be present in its
+    // OWN string output there. What this test can still usefully prove, at the App level, is that
+    // "/help" actually DISPATCHES (no `slashCommands` method is called -- `NEVER_CALLED_SLASH_COMMANDS`
+    // would throw if it were) and that the resulting notice reaches the live transcript.
+    //
+    // It can no longer assert every command is SIMULTANEOUSLY VISIBLE in `lastFrame()`, though:
+    // `helpText()`'s real output (15 commands + a blank line + "Keybindings:" + 20 keybindings) is
+    // far taller than this harness's fixed, ~18-row transcript viewport (see transcript.tsx's own
+    // header comment on why `Transcript` clips rather than growing unboundedly now) -- older lines
+    // of that one long notice get clipped off the top, exactly like an overflowing multi-message
+    // conversation would. Only the TAIL of the notice (the last keybinding line) is guaranteed to
+    // still be on screen, the same "newest content survives, oldest gets clipped" contract this
+    // file's transcript.test.tsx already covers directly.
     const session = new Session({
       streamFn: () => fakeStream(),
       initialState: { model: FAKE_MODEL, systemPrompt: "test" },
@@ -1129,14 +1375,12 @@ describe("App -- '/command' dispatch", () => {
     }
     stdin.write("\r");
     await wait(20);
-    stdin.write("\x0F"); // Ctrl+O -- multi-line tool output starts collapsed to its first line
-    await wait(10);
 
     const frame = lastFrame() ?? "";
-    for (const command of SLASH_COMMANDS) {
-      expect(frame).toContain(command.usage);
-      expect(frame).toContain(command.description);
-    }
+    // The very last line of helpText()'s own output -- guaranteed to survive the clip since the
+    // transcript bottom-anchors on overflow, always keeping the newest tail of content on screen.
+    expect(frame).toContain("(drop a file)");
+    expect(frame).toContain("to attach it");
   });
 
   it("/status shows model/reasoning/tokens/cost, calling no slashCommands method", async () => {
@@ -2522,10 +2766,13 @@ describe("App -- esc to interrupt", () => {
     expect(abortSpy).not.toHaveBeenCalled();
   });
 
-  it("Escape interrupts an in-flight turn even while the '/' menu is open, instead of clearing the input", async () => {
-    // Real, deliberate priority decision documented in app.tsx's useInput handler: interrupting a
-    // running generation wins over the live "/" menu's own Escape-clears-input behavior when a
-    // keypress could plausibly mean either (typing "/" while a previous turn is still streaming).
+  it("Escape closes the '/' menu (or clears typed text) instead of interrupting an in-flight turn -- only a SECOND Escape, with nothing left to back out of, aborts", async () => {
+    // Real, reported bug this is a regression test for: typing "/model" while a previous turn was
+    // still streaming, then pressing Escape to back out of composing it, used to abort the whole
+    // in-flight turn instead of just closing the menu -- Escape's meaning depends on what's actually
+    // in front of the user (see app.tsx's own useInput handler comment), so a menu/uncommitted text
+    // must be cleared FIRST; the global "interrupt the running turn" behavior is only reachable once
+    // there's nothing local left to cancel.
     const stream = fakeStream();
     const session = new Session({
       streamFn: () => stream,
@@ -2555,10 +2802,63 @@ describe("App -- esc to interrupt", () => {
     await wait(20);
     expect(lastFrame()).toContain("… "); // PromptInput's own busy indicator
 
-    // Type "/" into the now-empty box while the turn is still in flight -- PromptInput's own
-    // useInput handler doesn't gate ordinary character input on `busy`, so this opens the live
-    // autocomplete menu (see the "live '/' autocomplete menu" describe block above for the same
-    // "(highlighted/total)" footer convention) at the same time a turn is genuinely running.
+    // Type "/model" (its FULL exact name) into the now-empty box while the turn is still in flight
+    // -- PromptInput's own useInput handler doesn't gate ordinary character input on `busy`, so this
+    // both opens and then immediately re-closes the live autocomplete menu (deriveCommandMenu closes
+    // it the instant the typed token exactly matches a command name, since there's nothing left to
+    // disambiguate) -- the exact real-bug shape: no menu open, but real uncommitted text still sits
+    // in the box.
+    for (const ch of "/model") {
+      stdin.write(ch);
+      await wait(5);
+    }
+
+    stdin.write("\x1b"); // First Escape: clears the typed "/model", does NOT abort.
+    await wait(40);
+
+    expect(abortSpy).not.toHaveBeenCalled();
+    // The box is empty again, but the turn is still genuinely running -- PromptInput's own busy
+    // placeholder ("working…"), not the idle one, is what proves the input actually cleared here.
+    expect(lastFrame()).toContain("working…");
+    expect(lastFrame()).not.toContain("/model");
+
+    stdin.write("\x1b"); // Second Escape: box is now empty, nothing left to clear -- this aborts.
+    await wait(40);
+
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("Escape closes an open '/' menu (a partial, ambiguous match) without aborting an in-flight turn", async () => {
+    const stream = fakeStream();
+    const session = new Session({
+      streamFn: () => stream,
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const abortSpy = vi.spyOn(session, "abort");
+    const { lastFrame, stdin } = render(
+      <App
+        session={session}
+        setup={NEVER_CALLED_SETUP}
+        version="1.0.0"
+        cwd="/test"
+        runShellCommand={NEVER_CALLED_RUN_SHELL_COMMAND}
+        slashCommands={NEVER_CALLED_SLASH_COMMANDS}
+        spawnEditor={NEVER_CALLED_SPAWN_EDITOR}
+        readClipboardImage={NEVER_CALLED_READ_CLIPBOARD_IMAGE}
+        readClipboardText={NEVER_CALLED_READ_CLIPBOARD_TEXT}
+        readDroppedFile={DEFAULT_READ_DROPPED_FILE}
+      />,
+    );
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+
+    // "/" alone is ambiguous (matches every command) -- the live menu stays open, unlike the exact-
+    // match case in the sibling test above.
     stdin.write("/");
     await wait(20);
     expect(lastFrame()).toContain(`(1/${SLASH_COMMANDS.length})`); // menu is open
@@ -2566,10 +2866,10 @@ describe("App -- esc to interrupt", () => {
     stdin.write("\x1b"); // Escape
     await wait(40);
 
-    expect(abortSpy).toHaveBeenCalledTimes(1);
-    // The menu's own Escape handling (clearing the input back to the empty-box placeholder) never
-    // ran -- if it had, this placeholder text would be showing instead.
-    expect(lastFrame()).not.toContain("type a prompt (or !command, /command), enter to send");
+    expect(abortSpy).not.toHaveBeenCalled();
+    // Turn is still running -- busy placeholder, not the idle one, proves the "/" actually cleared.
+    expect(lastFrame()).toContain("working…");
+    expect(lastFrame()).not.toContain(`(1/${SLASH_COMMANDS.length})`); // menu is closed
   });
 
   it("the box is usable again for a normal new prompt after an aborted turn completes", async () => {
@@ -2817,6 +3117,948 @@ describe("App -- cursor-based line editing", () => {
   });
 });
 
+describe("App -- option+delete deletes a word at a time", () => {
+  // Option+Delete's own word-chunk behavior (app.tsx's `deleteWordBeforeCursor`), matching Claude
+  // Code/VS Code/readline: skip any run of whitespace immediately behind the cursor, then delete
+  // the run of non-whitespace behind THAT, stopping at a real "\n" either way. "\x1b\x7f" is
+  // ink/build/parse-keypress.js's own ESC-prefixed DEL byte sequence for a real terminal's
+  // Option+Delete -- confirmed directly (same file, same technique as this file's other
+  // key-sequence comments) that it parses to `{ name: "backspace", meta: true }`, exactly the
+  // `key.meta && key.backspace` branch app.tsx's useInput handler checks for this.
+  it("deletes the previous word in one chunk from the end of the input, not just one character", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello world foo bar") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("hello world foo");
+    expect(frame).not.toContain("bar");
+
+    stdin.write("\x1b\x7f"); // option+delete again
+    await wait(10);
+
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("hello world");
+    expect(frame).not.toContain("foo");
+  });
+
+  it("removes the whole preceding word AND its separating space in one press when the cursor sits exactly between two words", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello world") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+    // Cursor starts at 11 (the end); five lefts land it right before "world" (index 6), i.e.
+    // "hello |world" -- the exact word boundary, not mid-word and not mid-whitespace.
+    for (let i = 0; i < 5; i++) {
+      stdin.write("\x1b[D");
+      await wait(5);
+    }
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("world");
+    expect(frame).not.toContain("hello");
+  });
+
+  it("only deletes the portion of the current word behind the cursor when the cursor sits mid-word, not the whole word", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello world") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+    // Cursor starts at 11 (the end); three lefts land it at index 8, i.e. "hello wo|rld" -- squarely
+    // inside "world", between "wo" and "rld".
+    for (let i = 0; i < 3; i++) {
+      stdin.write("\x1b[D");
+      await wait(5);
+    }
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    // Only "wo" (the part of "world" behind the cursor) is gone -- "hello " is untouched (word
+    // deletion never crosses INTO a preceding word once it's already inside a different one) and
+    // "rld" (ahead of the cursor) is untouched too.
+    expect(frame).toContain("hello rld");
+    expect(frame).not.toContain("hello world");
+    expect(frame).not.toContain("hello  rld"); // (not two spaces -- "hello" itself wasn't touched)
+  });
+
+  it("consumes an entire irregular run of whitespace before deleting the preceding word, not just one adjacent space", async () => {
+    // NOTE: this deliberately positions the cursor right AFTER the irregular whitespace run
+    // (i.e. right before "two"), not at the very end of the string. Confirmed directly against
+    // `deleteWordBeforeCursor`'s real algorithm that pressing from the very end of "one   two"
+    // only ever deletes "two" itself in a single press -- the whitespace-skip loop only ever looks
+    // at whitespace immediately BEHIND the cursor, and at that position "two" (not whitespace) is
+    // what's immediately behind it. Positioning the cursor right after the whitespace run instead
+    // exercises that skip loop against a real irregular run (three spaces, not one) before it
+    // continues into deleting the word behind THAT -- proving the loop consumes the WHOLE run
+    // rather than stopping after just one space, which is the actual regression risk here.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "one   two") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+    // Cursor starts at 9 (the end); three lefts land it at index 6, right before "two" and right
+    // after all three separating spaces.
+    for (let i = 0; i < 3; i++) {
+      stdin.write("\x1b[D");
+      await wait(5);
+    }
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    // All three spaces AND "one" (the word behind them) are gone in one press, leaving exactly
+    // "two" -- not "one" (with some spaces stuck to it), which a loop that only skipped one space
+    // at a time before deleting would incorrectly leave behind.
+    expect(frame).toContain("two");
+    expect(frame).not.toContain("one");
+  });
+
+  it("is a no-op at the very start of the input, with nothing to delete and no crash", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b[H"); // Home -- cursor to position 0
+    await wait(10);
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("hello"); // completely unchanged
+    expect(hasExited(frame)).toBe(false); // and nothing crashed
+  });
+
+  it("does not cross a real newline into the previous line", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "ab") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r"); // option+enter -- inserts a real "\n"
+    await wait(10);
+    for (const ch of "cd") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+    // Cursor starts at 5 (the end, "ab\ncd"); two lefts land it at index 3 -- position 0 WITHIN
+    // line two, right after the "\n" and right before "c".
+    stdin.write("\x1b[D");
+    await wait(5);
+    stdin.write("\x1b[D");
+    await wait(5);
+
+    stdin.write("\x1b\x7f"); // option+delete
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    // A genuine no-op: nothing from line one was deleted, the lines weren't merged, line two is
+    // untouched too.
+    expect(frame).toContain("> ab");
+    expect(frame).toContain("  cd");
+    expect(hasExited(frame)).toBe(false);
+  });
+
+  it("fn+option+delete (forward direction) deletes the word AHEAD of the cursor without moving the cursor", async () => {
+    // "\x1b[3;3~" is the standard xterm/iTerm CSI sequence for the forward-Delete key held with
+    // the Alt/Option modifier (CSI 3 -- the "delete" key's own number in ink/build/parse-keypress.js's
+    // `kittySpecialNumberKeys`/legacy `keyName` maps -- ; 3 -- the "Alt" modifier code -- ~).
+    // Confirmed directly (node, against the real `parseKeypress` in
+    // node_modules/ink/build/parse-keypress.js) that this parses to
+    // `{ name: "delete", meta: true, ctrl: false, shift: false }`, and against
+    // node_modules/ink/build/hooks/use-input.js's own `delete: keypress.name === "delete"` that
+    // this really does set `key.delete` -- so together this is a real, reproducible `key.meta &&
+    // key.delete`, exactly the branch app.tsx's useInput handler routes to
+    // `deleteWordAfterCursor`. Reproducible through ink-testing-library's stdin.write exactly like
+    // Home/End's own CSI sequences elsewhere in this file.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello world") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+    // Cursor starts at 11 (the end); five lefts land it right before "world" (index 6).
+    for (let i = 0; i < 5; i++) {
+      stdin.write("\x1b[D");
+      await wait(5);
+    }
+
+    stdin.write("\x1b[3;3~"); // fn+option+delete (forward)
+    await wait(10);
+
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("hello");
+    expect(frame).not.toContain("world");
+
+    // Proves the cursor itself never moved (deleteWordAfterCursor's own header comment): typing
+    // now inserts exactly where "world" used to start, not at the string's end.
+    stdin.write("X");
+    await wait(10);
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("hello X");
+  });
+});
+
+// Regression coverage for a real, live-caught bug: up/down arrow used to be a total no-op for the
+// prompt box (they only ever navigated the live "/" menu, see the describe block below) -- fine
+// before multi-line composition existed, but once option+enter could put a real second line in the
+// box, there was no way to move the caret vertically at all short of holding left-arrow across the
+// whole line. Confirmed live via a real render before the fix: typing "line one text", option+enter,
+// typing "line two text", then pressing up-arrow left the cursor sitting on line two exactly where
+// it was; after the fix it jumps to the same column on line one instead. These tests all prove the
+// cursor genuinely moved by typing a character afterward and checking which line it lands in --
+// `PromptInput`'s cursor isn't exposed directly (no `inverse`-styling assertions elsewhere in this
+// file either), so the resulting text edit is the only observable proof.
+describe("App -- vertical cursor movement (up/down arrow) across multi-line prompts", () => {
+  it("pressing up-arrow after composing two lines moves the cursor onto line one, not line two", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "aaaa") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r"); // option+enter -- inserts "\n"
+    await wait(10);
+    for (const ch of "bbbb") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    stdin.write("\x1b[A"); // up arrow -- cursor sits at the end of line two (col 4), moves to line one's col 4
+    await wait(10);
+    stdin.write("X");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("> aaaaX"); // new character landed on line one, at the end of it
+    expect(frame).toContain("  bbbb"); // line two completely untouched
+    expect(frame).not.toContain("bbbbX");
+  });
+
+  it("up then down returns the cursor to editing line two again", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "aaaa") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r");
+    await wait(10);
+    for (const ch of "bbbb") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    stdin.write("\x1b[A"); // up -- onto line one
+    await wait(10);
+    stdin.write("X");
+    await wait(10);
+    expect(lastFrame()).toContain("> aaaaX");
+
+    stdin.write("\x1b[B"); // down -- back onto line two
+    await wait(10);
+    stdin.write("Y");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("  bbbbY"); // new character landed on line two this time
+    expect(frame).toContain("> aaaaX"); // line one unchanged by the round trip
+  });
+
+  it("moving up from a shorter line two onto a longer line one clamps to line two's own cursor column", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "abcdefgh") {
+      // line one, 8 characters
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r");
+    await wait(10);
+    for (const ch of "xy") {
+      // line two, only 2 characters -- cursor ends at column 2
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    stdin.write("\x1b[A"); // up -- clamps to column 2 on line one (its own length is 8), not start/end
+    await wait(10);
+    stdin.write("Z");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("abZcdefgh"); // "Z" landed right after column 2 ("ab"), not at either edge
+    expect(frame).toContain("  xy"); // line two untouched
+  });
+
+  it("up-arrow on the first line (a single-line prompt with no newline at all) is a genuine no-op", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    // Two lefts land the cursor at column 3 ("hel|lo"), a non-edge position so a wrongly-moved
+    // cursor (e.g. reset to column 0) would be obviously visible in the resulting text.
+    stdin.write("\x1b[D");
+    await wait(5);
+    stdin.write("\x1b[D");
+    await wait(5);
+
+    stdin.write("\x1b[A"); // up arrow -- already on (and is) the only line, must be a no-op
+    await wait(10);
+    stdin.write("X");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("helXlo"); // cursor never moved -- "X" landed exactly where it was left
+    expect(hasExited(frame)).toBe(false); // and nothing threw
+  });
+
+  it("down-arrow on the last line of a multi-line prompt is a genuine no-op", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "aaa") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r");
+    await wait(10);
+    for (const ch of "bbb") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    stdin.write("\x1b[B"); // down arrow -- already on the last line, must be a no-op
+    await wait(10);
+    stdin.write("Z");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("bbbZ"); // "Z" appended right where the cursor already was
+    expect(frame).toContain("> aaa"); // line one untouched
+    expect(hasExited(frame)).toBe(false);
+  });
+
+  it("up/down still navigate the live '/' autocomplete menu, completely unaffected by vertical cursor movement", async () => {
+    // Existing coverage ("down-arrow moves the highlight..." above) already proves down-arrow still
+    // drives the menu; this rounds it out with up-arrow specifically (previously untested on its
+    // own), round-tripping down then up and confirming Enter still dispatches the ORIGINAL
+    // top match ("/new") rather than falling through to the new vertical-cursor branch (which would
+    // be a silent no-op here, not a visible failure, since promptText is a single line either way).
+    const streamFn = vi.fn(() => fakeStream());
+    const session = new Session({
+      streamFn,
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const freshSession = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: MODEL_TWO, systemPrompt: "test" },
+    });
+    const startNewSession = vi.fn(async () => freshSession);
+    const slashCommands = fakeSlashCommands({ startNewSession });
+    const { lastFrame, stdin } = renderApp(session, { slashCommands });
+
+    stdin.write("/");
+    await wait(10);
+    stdin.write("\x1b[B"); // down -- off "new" (index 0) onto "resume" (index 1)
+    await wait(10);
+    stdin.write("\x1b[A"); // up -- back onto "new" (index 0)
+    await wait(10);
+    stdin.write("\r"); // dispatches the highlighted "/new", zero args
+    await wait(30);
+
+    expect(startNewSession).toHaveBeenCalledTimes(1);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("second-provider/second-model");
+    expect(frame).not.toContain("fake-provider/fake-model");
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+});
+
+// Regression coverage for a real, live-caught rendering bug (reported as literal garbled text
+// appearing while composing a long prompt and pressing arrow keys): PromptInput used to render each
+// line's marker + cursor-split pieces ("before" text, the single `inverse`-styled character AT the
+// cursor, "after" text) as SIBLING <Text> elements inside a <Box> row. Ink lays out sibling <Text>
+// nodes inside a <Box> as independent yoga nodes, each wrapping its OWN content against its OWN
+// computed width (ink/build/render-node-to-output.js calls `wrapText` once per `ink-text` node, not
+// once for a whole row) -- invisible for short lines that never actually wrap, but once a SINGLE
+// LOGICAL LINE (no explicit "\n" at all, just length) got long enough to wrap at the terminal's
+// column width, moving the cursor (which changes the "before"/"after" slice lengths) reshuffled each
+// piece's own independent wrap point, visibly reflowing/scrambling the on-screen text on every single
+// arrow-key press even though the underlying text never changed. The fix (see app.tsx's own header
+// comment right above `PromptInput`'s `lines.map(...)` render) nests marker/before/cursor-char/after
+// as children of ONE parent <Text> per line instead of siblings of a <Box>, so Ink's own
+// `squashTextNodes` (ink/build/squash-text-nodes.js) merges them into a single string that gets
+// wrapped ONCE, as one continuous unit, regardless of where the cursor sits.
+//
+// `ink-testing-library`'s stdout reports 100 columns (its own `Stdout.columns` getter, confirmed by
+// reading node_modules/ink-testing-library/build/index.js directly), so a continuous 240-character
+// run with NO spaces (one single unbreakable "word", confirmed live to hard-wrap into three visual
+// rows at that width) is comfortably over that width and guaranteed to wrap. `lastFrame()` returns
+// plain, ANSI-stripped text (confirmed directly, same as the empty-prompt-box tests' own note above),
+// so the `inverse`-styled cursor character renders as an perfectly ordinary character with no visible
+// marker of its own -- these tests can't see the caret directly, only prove the rendered TEXT is
+// completely unaffected by a pure cursor move (this test block), and separately prove the caret's
+// LOGICAL position stayed correct throughout by checking what a subsequent keystroke inserts (the
+// other two). Frames are compared with all whitespace collapsed out via `stripWhitespace`: Ink's own
+// wrap points insert line breaks that aren't part of the actual typed text, and -- right when the
+// cursor sits exactly past the last real character -- `PromptInput`'s own cursor-placeholder renders
+// a literal filler space (`line[cursorCol] ?? " "`) that also isn't part of it; collapsing whitespace
+// makes the comparison robust to both without weakening what it actually proves, since none of the
+// long test strings below contain any real spaces of their own.
+//
+// This exact scenario (sibling-<Text>-in-<Box> reflowing on cursor move vs. nested-<Text>-in-<Text>
+// staying stable) was independently confirmed against a standalone, `app.tsx`-independent
+// reproduction using raw `ink`/`ink-testing-library` components mirroring both shapes exactly, run
+// directly during development (not committed here) -- the old sibling-<Text>-in-<Box> shape visibly
+// corrupted the rendered text on a simulated cursor move (dropped/duplicated characters, a stray gap)
+// while the nested-<Text>-in-<Text> shape (what `PromptInput` uses today) stayed byte-for-byte
+// identical apart from where the cursor sits, exactly matching this file's own bug/fix description.
+describe("App -- long single-line prompt wrapping (no embedded newlines) stays stable across cursor moves", () => {
+  const stripWhitespace = (frame: string | undefined) => (frame ?? "").replace(/\s+/g, "");
+
+  it("moving the cursor within a long wrapped line never changes the line's rendered text, only where the caret sits", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    const longLine = "word".repeat(60); // 240 chars, one continuous run, no spaces -- wraps 3x at 100 cols
+    for (const ch of longLine) {
+      stdin.write(ch);
+      await wait(2);
+    }
+    await wait(30);
+    const beforeMove = stripWhitespace(lastFrame());
+    expect(beforeMove).toContain(longLine);
+
+    // Left-arrow a few times, then right-arrow partway back -- neither should ever touch the text
+    // itself, only where the (invisible-to-lastFrame) caret sits within it.
+    for (let i = 0; i < 5; i += 1) {
+      stdin.write("\x1b[D");
+      await wait(5);
+      expect(stripWhitespace(lastFrame())).toBe(beforeMove);
+    }
+    for (let i = 0; i < 3; i += 1) {
+      stdin.write("\x1b[C");
+      await wait(5);
+      expect(stripWhitespace(lastFrame())).toBe(beforeMove);
+    }
+  });
+
+  it("typing after moving the cursor within a wrapped line inserts at the correct logical position, not wherever the last wrap wound up", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    // Four distinct 60-char runs (240 total) -- landing the cursor exactly on the "b"/"c" boundary
+    // and inserting there produces an unambiguous expected substring, not just "some 'a' plus some
+    // extra 'a's" the way one repeated character everywhere would.
+    const longLine = "a".repeat(60) + "b".repeat(60) + "c".repeat(60) + "d".repeat(60);
+    for (const ch of longLine) {
+      stdin.write(ch);
+      await wait(2);
+    }
+    await wait(30);
+
+    // Cursor starts at the end (240); 120 lefts land it exactly on the "b"/"c" boundary.
+    for (let i = 0; i < 120; i += 1) {
+      stdin.write("\x1b[D");
+      await wait(2);
+    }
+    await wait(30);
+    stdin.write("Z");
+    await wait(30);
+
+    const expected = `${longLine.slice(0, 120)}Z${longLine.slice(120)}`;
+    expect(stripWhitespace(lastFrame())).toContain(expected);
+  });
+
+  it("regression: interleaved cursor moves and edits on a long wrapped line splice exactly like plain string arithmetic, with no corruption", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    const longLine = "word".repeat(60); // 240 chars
+    for (const ch of longLine) {
+      stdin.write(ch);
+      await wait(2);
+    }
+    await wait(30);
+
+    // `expected` is built by mirroring PromptInput's own cursor/insert arithmetic exactly
+    // (left-arrow: pos -= 1; typing a character: splice it in at pos, then pos += 1) rather than by
+    // hand-computing an index -- the same "predict the result from plain string operations" check
+    // the live bug report itself relied on: type long text, move the cursor, keep typing, and see if
+    // the result matches simple splicing.
+    let pos = longLine.length;
+    let expected = longLine;
+    const applyLeft = () => {
+      pos = Math.max(0, pos - 1);
+    };
+    const applyInsert = (ch: string) => {
+      expected = expected.slice(0, pos) + ch + expected.slice(pos);
+      pos += 1;
+    };
+
+    stdin.write("\x1b[D"); // left
+    applyLeft();
+    await wait(10);
+    stdin.write("A");
+    applyInsert("A");
+    await wait(10);
+    stdin.write("\x1b[D"); // left again
+    applyLeft();
+    await wait(10);
+    stdin.write("B");
+    applyInsert("B");
+    await wait(10);
+
+    expect(stripWhitespace(lastFrame())).toContain(expected);
+  });
+});
+
+// Regression coverage for round 2 of the up/down-arrow fix (see app.tsx's own header comment right
+// above `moveCursorVertically`): round 1 only ever moved the cursor between LOGICAL lines (ones
+// separated by a real "\n" from option+enter), same column, clamped to each line's own length --
+// still a total no-op on a SINGLE long line with no "\n" at all that nonetheless visually wraps
+// across several terminal rows, exactly the common case a real long prompt hits. The fix additionally
+// tracks the VISUAL row within whichever logical line the caret is on, via `visualRowsForLine`, which
+// wraps `markerFor(lineIndex) + lines[lineIndex]` through the SAME `wrap-ansi` library and options
+// (`{trim: false, hard: true}`) Ink itself uses internally (ink/build/wrap-text.js) -- so the computed
+// visual-row boundaries match pixel-for-pixel what Ink actually renders.
+//
+// These tests mirror that exact computation locally (importing the very same `wrap-ansi` package,
+// already a direct `packages/tui` dependency -- see app.tsx's own header comment on `visualRowsForLine`)
+// rather than hand-deriving expected cursor positions by eye: `predictVerticalMove` below is a
+// faithful line-for-line port of `moveCursorVertically`/`visualRowsForLine`/`locateCursor` from
+// app.tsx, used only to PREDICT where the real app's cursor should land so the resulting text (the
+// only thing `lastFrame()` can actually observe -- see the wrapping describe block above's own note on
+// why cursor position must always be proven via a subsequently-typed marker character) can be checked
+// against an unambiguous, independently-computed expectation, the same "mirror the app's own
+// arithmetic" technique the "regression: interleaved..." test above already uses for horizontal
+// moves.
+//
+// `ink-testing-library` reports a fixed 100-column stdout (confirmed directly above, and reused here)
+// -- content below is deliberately WORD-heavy (real spaces, `"word ".repeat(n)`-style), not one
+// unbroken run: `wrap-ansi`'s word-wrap breaks at the last space that still fits, which lands
+// meaningfully EARLIER than a naive fixed-width character cut the instant a word would otherwise be
+// split -- confirmed independently (a throwaway script, not committed here) that for the sentence
+// below, a one-up-arrow-from-the-end move lands two characters earlier (absolute position 181) than a
+// naive per-character-count wrap would predict (179, which falls mid-word inside "dogs") -- so this
+// content genuinely exercises the real word-wrap-aware fix, not a coincidence that would pass under a
+// simpler, wrong implementation too.
+describe("App -- visual-row-aware up/down navigation within a wrapped line", () => {
+  const markerFor = (lineIndex: number) => (lineIndex === 0 ? "> " : "  ");
+  const PROMPT_WIDTH = 100; // ink-testing-library's own fixed Stdout.columns, see the block above
+
+  function visualRowsForLine(lineIndex: number, lines: string[]): string[] {
+    return wrapAnsi(markerFor(lineIndex) + lines[lineIndex], PROMPT_WIDTH, {
+      trim: false,
+      hard: true,
+    }).split("\n");
+  }
+
+  function locateCursor(text: string, pos: number) {
+    const lines = text.split("\n");
+    let remaining = Math.max(0, Math.min(pos, text.length));
+    let cursorLine = 0;
+    for (; cursorLine < lines.length - 1; cursorLine++) {
+      const lineLength = lines[cursorLine].length;
+      if (remaining <= lineLength) break;
+      remaining -= lineLength + 1;
+    }
+    return { lines, cursorLine, cursorCol: remaining };
+  }
+
+  /** Faithful port of app.tsx's `moveCursorVertically` -- see that function's own header comment for
+   * the full algorithm description. Used here only to PREDICT the real app's behavior, never to
+   * replace observing it: every test below still drives the real `<App>` via real keystrokes and
+   * checks the real rendered frame. */
+  function predictVerticalMove(text: string, cursorPos: number, direction: -1 | 1): number {
+    const { lines, cursorLine, cursorCol } = locateCursor(text, cursorPos);
+    const lineStartOffset = (lineIndex: number) => {
+      let offset = 0;
+      for (let i = 0; i < lineIndex; i++) offset += lines[i].length + 1;
+      return offset;
+    };
+    const ownRows = visualRowsForLine(cursorLine, lines);
+    let remaining = markerFor(cursorLine).length + cursorCol;
+    let visualRow = 0;
+    for (; visualRow < ownRows.length - 1; visualRow++) {
+      if (remaining <= ownRows[visualRow].length) break;
+      remaining -= ownRows[visualRow].length;
+    }
+    const visualCol = remaining;
+    const flatPosFor = (
+      lineIndex: number,
+      rows: string[],
+      targetVisualRow: number,
+      desiredCol: number,
+    ) => {
+      const clampedCol = Math.min(desiredCol, rows[targetVisualRow].length);
+      let combined = clampedCol;
+      for (let i = 0; i < targetVisualRow; i++) combined += rows[i].length;
+      return lineStartOffset(lineIndex) + Math.max(0, combined - markerFor(lineIndex).length);
+    };
+    const targetVisualRow = visualRow + direction;
+    if (targetVisualRow >= 0 && targetVisualRow < ownRows.length) {
+      return flatPosFor(cursorLine, ownRows, targetVisualRow, visualCol);
+    }
+    const targetLine = cursorLine + direction;
+    if (targetLine < 0 || targetLine >= lines.length) return cursorPos; // already at the top/bottom
+    const targetRows = visualRowsForLine(targetLine, lines);
+    const targetVisualRowIndex = direction === -1 ? targetRows.length - 1 : 0;
+    return flatPosFor(targetLine, targetRows, targetVisualRowIndex, visualCol);
+  }
+
+  const stripWhitespace = (frame: string | undefined) => (frame ?? "").replace(/\s+/g, "");
+
+  // One continuous phrase repeated until it's long enough to word-wrap into exactly 3 visual rows at
+  // 100 columns (confirmed via `visualRowsForLine` above: row lengths 98/98/85, including the "> "
+  // marker on row 0 only) -- real spaces throughout, so `wrap-ansi` genuinely has word boundaries to
+  // respect rather than hard-breaking mid-word like a spaceless run would.
+  const WRAPPED_SENTENCE = (() => {
+    const sentence = "the quick brown fox jumps over lazy dogs while clever zebras run past ";
+    let line = "";
+    while (line.length < 260) line += sentence;
+    return line.trim();
+  })();
+
+  it("moving up from the end of a wrapped line lands on the same visual column one row up -- not where a naive character-count wrap would predict", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of WRAPPED_SENTENCE) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    await wait(30);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(WRAPPED_SENTENCE));
+
+    const expectedPos = predictVerticalMove(WRAPPED_SENTENCE, WRAPPED_SENTENCE.length, -1);
+    // Sanity-check this content is actually meaningful (word-wrap-dependent), not a position a naive
+    // fixed-width character cut would also happen to produce -- see the describe block's own header
+    // comment for the independently-confirmed naive prediction (179) this must differ from.
+    expect(expectedPos).toBe(181);
+    expect(expectedPos).not.toBe(179);
+
+    stdin.write("\x1b[A"); // up arrow
+    await wait(10);
+    stdin.write("Z");
+    await wait(20);
+
+    const expected = `${WRAPPED_SENTENCE.slice(0, expectedPos)}Z${WRAPPED_SENTENCE.slice(expectedPos)}`;
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+  });
+
+  it("repeatedly pressing up-arrow on a wrapped line stops cleanly at its own first visual row -- no wraparound, no throw", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of WRAPPED_SENTENCE) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    await wait(30);
+
+    // 4 presses is deliberately more than the 3 visual rows this line wraps into -- the first two
+    // presses actually move the cursor (end -> row 1 -> row 0); the remaining two must be pure no-ops
+    // once row 0 (the line's own first visual row) is reached.
+    let expectedPos = WRAPPED_SENTENCE.length;
+    for (let i = 0; i < 4; i++) {
+      stdin.write("\x1b[A");
+      expectedPos = predictVerticalMove(WRAPPED_SENTENCE, expectedPos, -1);
+      await wait(10);
+    }
+    expect(expectedPos).toBe(83); // settles here after 2 real moves; presses 3-4 are no-ops on top of it
+
+    stdin.write("Z");
+    await wait(20);
+
+    const expected = `${WRAPPED_SENTENCE.slice(0, expectedPos)}Z${WRAPPED_SENTENCE.slice(expectedPos)}`;
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+    expect(hasExited(lastFrame())).toBe(false); // and nothing threw along the way
+  });
+
+  // Two logical lines (joined by option+enter, "\x1b\r") built from clearly distinguishable word
+  // groups so each individual up/down step can be pinned to a specific row by its own vocabulary:
+  // line one wraps into exactly 2 visual rows -- row 0 is 16 "alpha" words plus a single-char "x"
+  // sentinel that exactly fills its 100-column budget (marker included), row 1 starts fresh with a
+  // "hi" sentinel followed by "beta" words (confirmed via `visualRowsForLine` above: row lengths
+  // 100/72) -- and line two is a short, single-row "close". Distinct vocabulary per row/line ("alpha"
+  // vs "hi"/"beta" vs "close") means a substring found near the cursor can only ever have come from
+  // one specific row, even where the exact landing column falls mid-word rather than on a clean word
+  // boundary (a real possibility once earlier steps have inserted marker characters that shift later
+  // columns by a char or two -- `predictVerticalMove` is used at every step specifically so the
+  // expected position always reflects that drift exactly, rather than an idealized guess).
+  const LINE_ONE_WORDS = `${"alpha ".repeat(16)}x hi ${"beta ".repeat(13)}beta`;
+  const LINE_TWO_WORD = "close";
+
+  it("cross-logical-line fallthrough moving UP: line two's row, then line one's own LAST visual row (hi/beta), then line one's own FIRST visual row (alpha), then stops", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of LINE_ONE_WORDS) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    stdin.write("\x1b\r"); // option+enter -- real "\n"
+    await wait(10);
+    for (const ch of LINE_TWO_WORD) {
+      stdin.write(ch);
+      await wait(2);
+    }
+    await wait(20);
+
+    const fullText = `${LINE_ONE_WORDS}\n${LINE_TWO_WORD}`;
+    let expectedPos = fullText.length; // cursor starts at the very end of line two
+
+    // Press 1: still within line two -> falls through onto line one's own LAST visual row (the
+    // "hi beta beta..." row), landing right after "hi beta" -- distinctly this row's own vocabulary,
+    // not line one's first ("alpha") row and not skipping over it.
+    stdin.write("\x1b[A");
+    expectedPos = predictVerticalMove(fullText, expectedPos, -1);
+    await wait(10);
+    expect(stripWhitespace(fullText.slice(0, expectedPos)).endsWith("hibeta")).toBe(true);
+    expect(stripWhitespace(fullText.slice(expectedPos)).startsWith("beta")).toBe(true);
+    stdin.write("1");
+    let expected = `${fullText.slice(0, expectedPos)}1${fullText.slice(expectedPos)}`;
+    expectedPos += 1;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+
+    // Press 2: still within line one (2 rows total) -> moves up onto its own FIRST visual row (the
+    // "alpha" row) -- this is a within-logical-line move, not a further cross-line fallthrough (line
+    // one only has 2 visual rows total). Lands right after the very first "alpha" word.
+    stdin.write("\x1b[A");
+    expectedPos = predictVerticalMove(expected, expectedPos, -1);
+    await wait(10);
+    expect(stripWhitespace(expected.slice(0, expectedPos))).toBe("alpha");
+    stdin.write("2");
+    expected = `${expected.slice(0, expectedPos)}2${expected.slice(expectedPos)}`;
+    expectedPos += 1;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+
+    // Press 3: already on line one's own first visual row -- must be a genuine no-op (stays put, no
+    // wraparound past the top, no fallthrough to a nonexistent line above).
+    stdin.write("\x1b[A");
+    const posBeforeNoOp = expectedPos;
+    expectedPos = predictVerticalMove(expected, expectedPos, -1);
+    expect(expectedPos).toBe(posBeforeNoOp);
+    await wait(10);
+    stdin.write("3");
+    expected = `${expected.slice(0, expectedPos)}3${expected.slice(expectedPos)}`;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+  });
+
+  it("cross-logical-line fallthrough moving DOWN: line one's own remaining visual rows first, then line two's FIRST visual row, without skipping anything", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of LINE_ONE_WORDS) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    stdin.write("\x1b\r");
+    await wait(10);
+    for (const ch of LINE_TWO_WORD) {
+      stdin.write(ch);
+      await wait(2);
+    }
+    await wait(20);
+    // Home jumps to the very start of line one (absolute position 0) -- confirmed elsewhere in this
+    // file ("home/end jump the cursor..."), reused here rather than a run of left-arrows.
+    stdin.write("\x1b[H");
+    await wait(10);
+
+    const fullText = `${LINE_ONE_WORDS}\n${LINE_TWO_WORD}`;
+    let expectedPos = 0; // cursor starts at the very beginning of line one (its own first visual row)
+
+    // Press 1: still within line one -> moves down onto its own remaining visual row, landing right
+    // after the "hi" sentinel that opens it -- not falling through to line two yet.
+    stdin.write("\x1b[B");
+    expectedPos = predictVerticalMove(fullText, expectedPos, 1);
+    await wait(10);
+    expect(stripWhitespace(fullText.slice(0, expectedPos)).endsWith("hi")).toBe(true);
+    expect(stripWhitespace(fullText.slice(expectedPos)).startsWith("beta")).toBe(true);
+    stdin.write("1");
+    let expected = `${fullText.slice(0, expectedPos)}1${fullText.slice(expectedPos)}`;
+    expectedPos += 1;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+
+    // Press 2: line one has no more visual rows below -> falls through onto line two's own FIRST (and
+    // only) visual row -- landing inside "close" (one column further right than press 1's clean
+    // boundary would alone suggest, since the "1" just inserted above shifted this row's own columns
+    // by one character; `predictVerticalMove` re-reads the CURRENT text, exactly like the real
+    // `moveCursorVertically` always does, so it reflects that shift precisely). "lose" only ever
+    // appears as a substring of line two's own "close" -- nowhere else in this text -- so landing
+    // inside it still unambiguously proves the fallthrough reached line two, not merely close to it.
+    stdin.write("\x1b[B");
+    expectedPos = predictVerticalMove(expected, expectedPos, 1);
+    await wait(10);
+    expect(stripWhitespace(expected.slice(expectedPos)).startsWith("lose")).toBe(true);
+    expect(expectedPos).toBeGreaterThan(LINE_ONE_WORDS.length + 1); // +1 for the inserted "1"
+    stdin.write("2");
+    expected = `${expected.slice(0, expectedPos)}2${expected.slice(expectedPos)}`;
+    expectedPos += 1;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+
+    // Press 3: already on line two's own only visual row -- genuine no-op, no throw.
+    stdin.write("\x1b[B");
+    const posBeforeNoOp = expectedPos;
+    expectedPos = predictVerticalMove(expected, expectedPos, 1);
+    expect(expectedPos).toBe(posBeforeNoOp);
+    await wait(10);
+    stdin.write("3");
+    expected = `${expected.slice(0, expectedPos)}3${expected.slice(expectedPos)}`;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+    expect(hasExited(lastFrame())).toBe(false);
+  });
+
+  it("regression: interleaved up-arrow moves and inserts on a wrapped line splice exactly like predicted, with no corruption", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of WRAPPED_SENTENCE) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    await wait(30);
+
+    // `expected`/`pos` are threaded through exactly like PromptInput's own state: each up-arrow
+    // predicts the new cursor position via `predictVerticalMove` (re-run against the CURRENT text,
+    // exactly like the real `moveCursorVertically` always reads `promptTextAtom.get()` fresh rather
+    // than a stale closure), and each insert splices at that position then advances it by one --
+    // mirroring `insertAtCursor`'s own `pos + str.length` exactly.
+    let expected = WRAPPED_SENTENCE;
+    let pos = expected.length;
+
+    stdin.write("\x1b[A"); // up -- lands on row 1 (the wrapped line's middle row)
+    pos = predictVerticalMove(expected, pos, -1);
+    await wait(10);
+    stdin.write("A");
+    expected = `${expected.slice(0, pos)}A${expected.slice(pos)}`;
+    pos += 1;
+    await wait(10);
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+
+    stdin.write("\x1b[A"); // up again -- re-wrapped text (one char longer) still lands cleanly on row 0
+    pos = predictVerticalMove(expected, pos, -1);
+    await wait(10);
+    stdin.write("B");
+    expected = `${expected.slice(0, pos)}B${expected.slice(pos)}`;
+    pos += 1;
+    await wait(10);
+
+    expect(stripWhitespace(lastFrame())).toContain(stripWhitespace(expected));
+  });
+});
+
 // Regression coverage for a fix to the empty-prompt-box cursor: PromptInput used to only render the
 // inverted-video cursor caret (`<Text inverse>`) when `input.length > 0`, so a fully empty box --
 // the very first thing a user sees on launch, and the state the box returns to after every submit --
@@ -3016,6 +4258,35 @@ describe("App -- ctrl+c/ctrl+d exit scheme (pi's stateful scheme)", () => {
     expect(hasExited(frame)).toBe(false);
     expect(frame).toContain("hi"); // box is completely unchanged
   });
+
+  it("the 'press again to exit' arming naturally expires after EXIT_ARM_WINDOW_MS with no second press, un-arming exitArmed on its own", async () => {
+    // app.tsx's own `exitArmTimeoutRef`/`EXIT_ARM_WINDOW_MS` (1500ms): the first ctrl+c on an
+    // empty box arms `atoms.exitArmed` AND schedules a real `setTimeout` that un-arms it again if
+    // no second press follows within the window. A real (not mocked) timer -- this test just waits
+    // it out on the wall clock, well past vitest's default 5s-per-test budget were it not for this
+    // suite's own `testTimeout: 20_000` (vitest.config.ts).
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    stdin.write("\x03"); // ctrl+c, nothing typed -- arms the hint
+    await wait(10);
+    expect(lastFrame()).toContain("Press ctrl+c again to exit.");
+
+    await wait(1600); // past EXIT_ARM_WINDOW_MS with no second press
+
+    const frame = lastFrame() ?? "";
+    expect(frame).not.toContain("Press ctrl+c again to exit.");
+    expect(hasExited(frame)).toBe(false); // never armed a second time, so this never exits either
+
+    // A ctrl+c now starts the arming sequence over from scratch, proving the window really reset
+    // rather than leaving some other latent "already armed" state behind.
+    stdin.write("\x03");
+    await wait(10);
+    expect(lastFrame()).toContain("Press ctrl+c again to exit.");
+  }, 20_000);
 });
 
 // ctrl+o used to also expand the startup banner into its full KEYBINDINGS list, in the same
@@ -3031,19 +4302,23 @@ describe("App -- ctrl+c/ctrl+d exit scheme (pi's stateful scheme)", () => {
 // entirely instead of renamed.
 
 describe("App -- ctrl+t expands/collapses 'thinking' content blocks", () => {
-  it("keeps an already-settled thinking block visible after ctrl+t; only hides new ones from then on", async () => {
+  it("ctrl+t retroactively hides an already-settled thinking block too -- a global, reversible toggle, not a one-way freeze", async () => {
     // ADR 0014's pi-parity follow-up flipped the default: thinking is now VISIBLE by default
     // (thinkingExpandedAtom starts at `true`, see app.tsx), and ctrl+t hides it entirely -- there
-    // is no placeholder state at all, a hidden thinking block occupies zero rows. But a thinking
-    // block already settled into <Static> is frozen the first time it renders (see transcript.tsx's
-    // header comment) -- ctrl+t can no longer retroactively hide it, matching a real terminal's own
-    // scrollback. So this drives TWO turns: the first settles visible before the toggle and must
-    // STAY visible after ctrl+t; the second is created after the toggle and must be hidden from the
-    // moment it appears.
-    let call = 0;
+    // is no placeholder state at all, a hidden thinking block occupies zero rows. Now that nothing
+    // freezes into permanent `<Static>` scrollback, `thinkingExpanded` is a single GLOBAL toggle
+    // applied uniformly to every item on every render (see transcript.tsx's own
+    // `TranscriptProps.thinkingExpanded` doc comment) -- unlike the old `<Static>`-based version,
+    // ctrl+t now retroactively hides an ALREADY-settled thinking block too, not just future ones.
+    //
+    // Kept to a single turn with no separate final-answer text block (rather than two turns, as an
+    // earlier version of this test did): this app's fixed-height transcript viewport (see
+    // transcript.tsx's own header comment) would clip content off-screen once the conversation grows
+    // past this harness's small simulated terminal height, which would make this test about clipping
+    // instead of about the toggle itself. "hi" (the user's own turn, already part of the
+    // conversation) stands in for "non-thinking content," proving the toggle leaves it alone.
     const session = new Session({
       streamFn: () => {
-        call += 1;
         const stream = fakeStream();
         stream.push({
           type: "done",
@@ -3051,10 +4326,7 @@ describe("App -- ctrl+t expands/collapses 'thinking' content blocks", () => {
           message: assistantMessage({
             // pi-ai's real ThinkingContent field is `.thinking`, not `.text` -- the exact bug ADR
             // 0014 found and fixed in transcript.tsx's contentBlocksToText.
-            content: [
-              { type: "thinking", thinking: call === 1 ? "secret reasoning" : "second reasoning" },
-              { type: "text", text: call === 1 ? "final answer" : "final answer two" },
-            ],
+            content: [{ type: "thinking", thinking: "secret reasoning" }],
             stopReason: "stop",
           }),
         });
@@ -3069,28 +4341,24 @@ describe("App -- ctrl+t expands/collapses 'thinking' content blocks", () => {
 
     let frame = lastFrame() ?? "";
     expect(frame).toContain("secret reasoning"); // visible by default
-    expect(frame).toContain("final answer");
+    expect(frame).toContain("hi");
 
-    stdin.write("\x14"); // ctrl+t -- toggles the live toggle for FUTURE thinking blocks only.
+    stdin.write("\x14"); // ctrl+t -- a global toggle, retroactively hiding this already-settled block.
     await wait(10);
 
     frame = lastFrame() ?? "";
-    // The FIRST thinking block is already frozen into Static -- ctrl+t does not retroactively hide
-    // it. This is the key assertion for this test now.
-    expect(frame).toContain("secret reasoning");
+    expect(frame).not.toContain("secret reasoning");
+    expect(frame).toContain("hi"); // non-thinking content is unaffected by the toggle
     // ctrl+t still pushes a transient confirmation into the transcript, matching how shift+tab
     // confirms "Reasoning effort set to ..." on its own toggle (see app.tsx's ctrl+t handler).
     expect(frame).toContain("Thinking blocks: hidden.");
 
-    await session.prompt("hi again");
+    stdin.write("\x14"); // toggle back on -- proves this is a live, reversible toggle, not a one-way hide.
     await wait(20);
 
     frame = lastFrame() ?? "";
-    // The SECOND thinking block is created after the toggle -- hidden from the moment it appears.
-    expect(frame).not.toContain("second reasoning");
-    expect(frame).toContain("final answer two");
-    // The first one is still visible, proving the toggle didn't retroactively change it either.
     expect(frame).toContain("secret reasoning");
+    expect(frame).toContain("Thinking blocks: visible.");
   });
 });
 
@@ -3530,16 +4798,18 @@ describe("App -- drop-file-to-attach (no keybinding; triggered by submitting a r
     }
     stdin.write("\r");
     await wait(20);
-    stdin.write("\x0F"); // Ctrl+O -- multi-line tool output starts collapsed to its first line
-    await wait(10);
 
     expect(readDroppedFile).toHaveBeenCalledWith("/help");
     const frame = lastFrame() ?? "";
     expect(frame).not.toContain("Unknown command");
-    for (const command of SLASH_COMMANDS) {
-      expect(frame).toContain(command.usage);
-      expect(frame).toContain(command.description);
-    }
+    // Same reasoning as "App -- '/command' dispatch"'s own "/help" test: `helpText()`'s real output
+    // is far taller than this harness's fixed transcript viewport, so only its tail (the last
+    // keybinding line) is guaranteed to still be on screen -- exhaustive content coverage lives in
+    // slash-commands.test.ts instead. What matters here is proving dispatch fell through to the
+    // normal "/" handling rather than being swallowed as an "Unknown command" by the dropped-file
+    // check, which the assertion above already covers.
+    expect(frame).toContain("(drop a file)");
+    expect(frame).toContain("to attach it");
   });
 });
 
@@ -3788,5 +5058,441 @@ describe("App -- Claude-Code-style follow-up message queue (plain Enter while bu
 
     expect(removeQueuedMessagesSpy).toHaveBeenCalledTimes(1); // called, but returns nothing to use
     expect(lastFrame()).toContain("type a prompt (or !command, /command), enter to send");
+  });
+});
+
+/** `NotificationLine` (app.tsx) is a fixed `height={1}` row rendered right after `<TranscriptView>`
+ * and right before the rule above the prompt box -- the FIRST pure "─" row in the frame is always
+ * that rule (same technique this file's "frames the prompt box" test above already uses), so the
+ * line directly above it is always exactly `NotificationLine`'s own single row, whatever it's
+ * currently showing (or blank, showing nothing). */
+function notificationLineOf(frame: string): string {
+  const lines = frame.split("\n");
+  const ruleIndex = lines.findIndex((line) => /^─+$/.test(line));
+  return ruleIndex > 0 ? lines[ruleIndex - 1] : "";
+}
+
+describe("App -- NotificationLine (exit-armed / busy+spinner / error, with priority exit-armed > busy > error)", () => {
+  it("shows nothing when idle -- not busy, no error, not exit-armed", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame } = renderApp(session);
+    await wait(10);
+
+    expect(notificationLineOf(lastFrame() ?? "").trim()).toBe("");
+  });
+
+  it("busy state: shows a spinner glyph plus 'working…' when there's no streamingText yet", async () => {
+    // A "!command" bash escape only ever sets `busyAtom` -- it never touches `streamingText` at all
+    // (see app.tsx's handleSubmit "!" branches) -- so this is the one realistic way to reach
+    // "busy, no streamingText" through the real app rather than reaching into atoms directly.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    let resolveRun: ((result: { output: string; isError: boolean }) => void) | undefined;
+    const runShellCommand: RunShellCommand = vi.fn(
+      () =>
+        new Promise<{ output: string; isError: boolean }>((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    const { lastFrame, stdin } = renderApp(session, { runShellCommand });
+
+    for (const ch of "!sleep 1") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+
+    const notificationLine = notificationLineOf(lastFrame() ?? "");
+    expect(notificationLine).toContain("working…");
+    // A real spinner glyph (one of app.tsx's own SPINNER_FRAMES, all non-ASCII braille dots) sits
+    // ahead of the text -- not asserting the exact frame/color (this harness renders with color
+    // disabled, and the exact frame is a moving target on a real interval), just that SOMETHING
+    // beyond plain ASCII precedes "working…", proving the spinner itself is actually there.
+    expect(notificationLine).not.toBe("working…");
+
+    resolveRun?.({ output: "done", isError: false }); // let the pending command settle
+    await wait(20);
+  });
+
+  it("busy state: shows the given streamingText (a real turn's fixed 'thinking...'/'responding…' status) instead of 'working…'", async () => {
+    // Driven through the real <TextInput>-equivalent submit path (stdin), not a direct
+    // `session.prompt()` call -- `busyAtom` (what NotificationLine's own `busy` check reads) is
+    // only ever set by `PromptInput`'s own `handleSubmit`, never by a session event on its own (see
+    // the "shows a startup banner..." test above for the same distinction). A direct `session.prompt()`
+    // call would leave `busyAtom` false the whole time, so NotificationLine would show nothing at
+    // all -- any "responding…" visible in that case would only be coming from `Transcript`'s own,
+    // separate `streamingText` box, not from `NotificationLine`.
+    const stream = fakeStream();
+    const session = new Session({
+      streamFn: () => stream,
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\r");
+    await wait(20);
+    stream.push({ type: "start", partial: assistantMessage({ content: [] }) });
+    stream.push({
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "Hi",
+      partial: assistantMessage({ content: [{ type: "text", text: "Hi" }] }),
+    });
+    await wait(60); // past the backpressure queue's ~33ms coalescing window
+
+    const notificationLine = notificationLineOf(lastFrame() ?? "");
+    expect(notificationLine).toContain("responding…");
+    expect(notificationLine).not.toContain("working…");
+  });
+
+  it("error state: shows the error text when idle (not busy, not exit-armed), truncated to the terminal's own column width", async () => {
+    // NotificationLine's own truncation (app.tsx): `error.length > width ? error.slice(0, width -
+    // 1) + "…" : error`, where `width` is `stdout.columns` (100 in this harness, already relied on
+    // elsewhere in this file). A 150-character error is well past that, so this also proves the
+    // truncation itself actually fires, not just that some error text shows.
+    const longError = `kernel failure: ${"x".repeat(140)}`;
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const runShellCommand: RunShellCommand = vi.fn(async () => {
+      throw new Error(longError);
+    });
+    const { lastFrame, stdin } = renderApp(session, { runShellCommand });
+
+    for (const ch of "!echo hi") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+
+    const notificationLine = notificationLineOf(lastFrame() ?? "");
+    const expectedTruncated = `${longError.slice(0, 99)}…`; // width(100) - 1 = 99 real characters + "…"
+    expect(notificationLine).toBe(expectedTruncated);
+    expect(notificationLine.length).toBeLessThan(longError.length); // genuinely shorter, not the full error
+    expect(notificationLine.endsWith("…")).toBe(true);
+  });
+
+  it("priority: the exit-armed notice outranks the busy spinner when both are true at once", async () => {
+    // A real, reachable scenario, not a contrived one: `handleSubmit` clears the prompt box the
+    // INSTANT a "!" command is submitted (well before it resolves), so the box is genuinely empty
+    // while a shell command is still in flight -- pressing ctrl+c there arms `exitArmed` while
+    // `busy` is still true, exactly like a real user getting impatient mid-command. Per
+    // NotificationLine's own header comment, exit-armed must win.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    let resolveRun: ((result: { output: string; isError: boolean }) => void) | undefined;
+    const runShellCommand: RunShellCommand = vi.fn(
+      () =>
+        new Promise<{ output: string; isError: boolean }>((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    const { lastFrame, stdin } = renderApp(session, { runShellCommand });
+
+    for (const ch of "!sleep 1") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+    expect(notificationLineOf(lastFrame() ?? "")).toContain("working…"); // busy, confirmed first
+
+    stdin.write("\x03"); // ctrl+c on the now-empty box -- arms exit while still busy
+    await wait(10);
+
+    const notificationLine = notificationLineOf(lastFrame() ?? "");
+    expect(notificationLine).toContain("Press ctrl+c again to exit.");
+    expect(notificationLine).not.toContain("working…");
+
+    resolveRun?.({ output: "done", isError: false }); // let the pending command settle
+    await wait(20);
+  });
+
+  // Priority between "busy" and "error" (busy always wins per NotificationLine's own `if (exitArmed)
+  // ... if (busy) ... if (error)` order) is not independently exercisable through this app's real
+  // control flow: every path that sets `errorAtom` (handleSubmit's various `.catch` blocks) does so
+  // in the SAME synchronous callback that already set `busyAtom.set(false)` first (see app.tsx), so
+  // React batches both into one re-render where busy is already false by the time error becomes
+  // visible -- there is no real user-reachable moment where both are simultaneously true. Every
+  // other test in this file that checks error text already implicitly relies on busy having been
+  // cleared first (e.g. "reports a rejected runShellCommand the same way a failed chat prompt is
+  // reported" above), so that ordering is still covered, just not as an independent priority check.
+});
+
+describe("App -- promptBoxRowCount (footer layout budget for the prompt box)", () => {
+  // promptBoxRowCount (app.tsx, unexported) isn't reachable directly, but its effect is directly
+  // observable: the prompt box's own rendered row count, between the rule above it and the rule
+  // below it (the same technique the "frames the prompt box" test above already uses to find those
+  // rules). `PROMPT_MARKER_WIDTH` (app.tsx, unexported, currently 2) plus each line's own text is
+  // what actually gets wrapped -- duplicated here as a literal `2` (with this comment tying it back)
+  // since importing an unexported constant isn't possible from a test file.
+  const PROMPT_MARKER_WIDTH = 2;
+  const TERMINAL_COLUMNS = 100; // this file's own established ink-testing-library constant
+
+  function expectedPromptRows(text: string): number {
+    const width = Math.max(TERMINAL_COLUMNS, 1);
+    return text.split("\n").reduce((total, line) => {
+      const wrapped = wrapAnsi(" ".repeat(PROMPT_MARKER_WIDTH) + line, width, {
+        trim: false,
+        hard: true,
+      });
+      return total + wrapped.split("\n").length;
+    }, 0);
+  }
+
+  function promptBoxLineCount(frame: string): number {
+    const lines = frame.split("\n");
+    const ruleIndices: number[] = [];
+    lines.forEach((line, index) => {
+      if (/^─+$/.test(line)) ruleIndices.push(index);
+    });
+    const [aboveRule, belowRule] = ruleIndices;
+    return belowRule - aboveRule - 1;
+  }
+
+  it("a single-line prompt occupies exactly one row", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    expect(promptBoxLineCount(lastFrame() ?? "")).toBe(expectedPromptRows("hello"));
+    expect(promptBoxLineCount(lastFrame() ?? "")).toBe(1);
+  });
+
+  it("a multi-line prompt (composed with option+enter) occupies exactly one row per line", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "line one") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    stdin.write("\x1b\r"); // option+enter -- inserts a real newline
+    await wait(10);
+    for (const ch of "line two") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    expect(promptBoxLineCount(lastFrame() ?? "")).toBe(expectedPromptRows("line one\nline two"));
+    expect(promptBoxLineCount(lastFrame() ?? "")).toBe(2);
+  });
+
+  it("a single long line with no embedded newline wraps across multiple rows, counted exactly like Ink's own wrap-ansi call", async () => {
+    // One long unbroken word: guarantees a hard mid-word wrap at the exact column boundary,
+    // independent of where any spaces happen to fall.
+    const longWord = "x".repeat(150);
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of longWord) {
+      stdin.write(ch);
+      await wait(1);
+    }
+    await wait(20);
+
+    const expected = expectedPromptRows(longWord);
+    expect(expected).toBeGreaterThan(1); // sanity: this really does wrap
+    expect(promptBoxLineCount(lastFrame() ?? "")).toBe(expected);
+  });
+});
+
+describe("App -- commandMenuRowCount (footer layout budget for the live '/' menu)", () => {
+  // commandMenuRowCount (app.tsx, unexported) isn't reachable directly either, but -- like
+  // promptBoxRowCount above -- its effect is directly observable: the number of rendered menu rows
+  // between the rule below the prompt box and the status bar's own cwd line (an exact, unique match
+  // per renderApp's default `cwd: "/test"`, the same technique the "frames the prompt box" test
+  // above uses for its own "cwd + data come strictly AFTER the closing rule" assertion).
+  const CWD = "/test"; // renderApp's own default
+
+  function menuLineCount(frame: string): number {
+    const lines = frame.split("\n");
+    const ruleIndices: number[] = [];
+    lines.forEach((line, index) => {
+      if (/^─+$/.test(line)) ruleIndices.push(index);
+    });
+    const belowPromptRule = ruleIndices[1];
+    const cwdIndex = lines.indexOf(CWD);
+    return cwdIndex - belowPromptRule - 1;
+  }
+
+  it("is 0 when the menu is closed (prompt text doesn't start with '/')", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "hello") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    expect(menuLineCount(lastFrame() ?? "")).toBe(0);
+  });
+
+  it("is matches.length + 1 when open with fewer matches than MENU_WINDOW_SIZE", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    for (const ch of "/mo") {
+      stdin.write(ch);
+      await wait(3);
+    }
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("(1/1)"); // exactly one match ("model")
+    expect(menuLineCount(frame)).toBe(1 + 1); // one match row + the "(n/total)" counter row
+  });
+
+  it("is capped at MENU_WINDOW_SIZE + 1 when open with more matches than the window size", async () => {
+    // A bare "/" matches every command -- 15 today (command-menu.tsx's own comment), comfortably
+    // more than MENU_WINDOW_SIZE (6), so the window cap is genuinely exercised here.
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+
+    stdin.write("/");
+    await wait(10);
+
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain(`(1/${SLASH_COMMANDS.length})`);
+    expect(SLASH_COMMANDS.length).toBeGreaterThan(MENU_WINDOW_SIZE); // sanity: the cap really applies
+    expect(menuLineCount(frame)).toBe(MENU_WINDOW_SIZE + 1);
+  });
+});
+
+describe("App -- mouse-wheel scrolling (mouse.ts's onWheel, wired up by RunningSession's own useEffect)", () => {
+  // The real production wiring (packages/cli/src/tui.tsx) calls `wrapStdinForMouse` on the real
+  // `process.stdin` BEFORE Ink ever mounts, entirely outside this component tree -- `App` itself
+  // never wraps stdin on its own. So driving a real wheel event against a mounted `<App>` here means
+  // feeding actual SGR mouse bytes through `wrapStdinForMouse` on a SEPARATE fake stream, not
+  // `renderApp()`'s own fake `stdin` (ink-testing-library's plain keypress-only fake, which knows
+  // nothing about mouse bytes). `mouse.ts`'s `onWheel` pub-sub is process-wide module state, not
+  // owned by any one `App` instance, so a wheel event produced this way reaches the exact same
+  // `onWheel` subscription `RunningSession`'s own `useEffect` (app.tsx) registers -- exactly like a
+  // real, separately-wired stdin would in production.
+  function createFakeMouseStdin() {
+    const emitter = new EventEmitter();
+    return Object.assign(emitter, {
+      isTTY: true,
+      setRawMode: vi.fn(),
+      ref: vi.fn(),
+      unref: vi.fn(),
+    });
+  }
+
+  /** Feeds `ticks` separate real SGR wheel reports (Cb=64 for "up", 65 for "down" -- see mouse.ts's
+   * own `WHEEL_BASE_BIT` comment) through a fresh `wrapStdinForMouse`-wrapped fake stream, each in
+   * its own "data" event -- matching how a real fast scroll burst still typically arrives as
+   * multiple discrete OS-level reports, one wheel "click" per `onWheel` firing. */
+  function scrollWheel(direction: "up" | "down", ticks: number): void {
+    const fakeStdin = createFakeMouseStdin();
+    wrapStdinForMouse(fakeStdin as unknown as NodeJS.ReadStream);
+    const code = direction === "up" ? 64 : 65;
+    for (let i = 0; i < ticks; i++) {
+      fakeStdin.emit("data", Buffer.from(`\x1b[<${code};10;10M`, "latin1"));
+    }
+  }
+
+  it("scrolling up reveals earlier, clipped conversation content, and submitting a new message resets scrollOffset back to 0", async () => {
+    // 30 short user messages, comfortably enough to overflow this harness's fixed 24-row simulated
+    // terminal (each renders as a 3-row UserMessageBar -- see transcript.tsx) and force real
+    // bottom-anchored clipping, the same precondition transcript.test.tsx's own scrollOffset tests
+    // rely on.
+    const messages = Array.from(
+      { length: 30 },
+      (_, i) =>
+        ({ role: "user", content: `scrollable message ${i}`, timestamp: i }) as AgentMessage,
+    );
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test", messages },
+    });
+    const { lastFrame, stdin } = renderApp(session);
+    await wait(20);
+
+    let frame = lastFrame() ?? "";
+    expect(frame).toContain("scrollable message 29"); // bottom-anchored to the newest by default
+    expect(frame).not.toContain("scrollable message 0"); // oldest clipped off the top
+
+    // Scroll up far enough to hit the very top clamp -- Transcript itself clamps `scrollOffset`
+    // against its own real measured content height (transcript.tsx's own header comment), so an
+    // intentionally generous tick count is always safe here, never an over-scroll bug of its own.
+    scrollWheel("up", 200);
+    await wait(20);
+
+    frame = lastFrame() ?? "";
+    expect(frame).toContain("scrollable message 0"); // the oldest message is reachable now
+
+    // Submitting a new message resets scrollOffset back to 0 (handleSubmit, app.tsx) -- matches
+    // ordinary chat-app behavior: sending a message snaps the view back to "show me what happens
+    // now."
+    for (const ch of "hi") {
+      stdin.write(ch);
+      await wait(5);
+    }
+    stdin.write("\r");
+    await wait(20);
+
+    frame = lastFrame() ?? "";
+    expect(frame).not.toContain("scrollable message 0"); // scrolled-to-the-top state was reset
+  });
+
+  it("wheel scrolling with nothing to scroll (a short conversation) doesn't crash and leaves the frame unchanged -- exercises RunningSession's onWheel subscription wiring on its own", async () => {
+    const session = new Session({
+      streamFn: () => fakeStream(),
+      initialState: { model: FAKE_MODEL, systemPrompt: "test" },
+    });
+    const { lastFrame } = renderApp(session);
+    await wait(20);
+
+    const before = lastFrame() ?? "";
+
+    expect(() => scrollWheel("up", 10)).not.toThrow();
+    await wait(20);
+    expect(() => scrollWheel("down", 10)).not.toThrow();
+    await wait(20);
+
+    // Nothing to scroll (the whole short conversation already fits) -- Transcript's own clamp keeps
+    // scrollOffset's effective value at 0 regardless of how much the atom itself moved, so the
+    // rendered frame never visibly changes.
+    expect(lastFrame() ?? "").toBe(before);
   });
 });

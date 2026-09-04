@@ -16,7 +16,7 @@
 // wired them in, so every keystroke re-rendered everything including the virtualized transcript --
 // caught by an L4 review before this milestone shipped).
 import type { AgentEvent, AgentMessage, Session } from "@nanocode/agent";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput, useStdout } from "ink";
 // Explicit React import: proven necessary by direct A/B testing against the real `npm run tui`
 // entrypoint (removing it reproduces "ReferenceError: React is not defined" here, even with
 // packages/tui's own local tsconfig.json in place) -- see tui.tsx's longer comment on the likely
@@ -24,11 +24,13 @@ import { Box, Text, useApp, useInput } from "ink";
 // not cleanly per file, once the graph is as large as this app's real one).
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import wrapAnsi from "wrap-ansi";
 import { type Atom, atom, useAtom } from "./atom.ts";
 import { createBackpressureQueue } from "./backpressure.ts";
-import { StartupBanner } from "./banner.tsx";
-import { CommandMenu } from "./command-menu.tsx";
+import { BANNER_ROWS, StartupBanner } from "./banner.tsx";
+import { CommandMenu, MENU_WINDOW_SIZE } from "./command-menu.tsx";
 import { CommandOverlay, type CommandOverlayKind, type OverlayResult } from "./command-overlay.tsx";
+import { onWheel } from "./mouse.ts";
 import { type ModelSetupController, SetupScreen } from "./setup-screen.tsx";
 import {
   deriveCommandMenu,
@@ -113,6 +115,13 @@ interface SessionAtoms {
   streamingText: Atom<string | undefined>;
   busy: Atom<boolean>;
   error: Atom<string | undefined>;
+  /** True for the `EXIT_ARM_WINDOW_MS` after the first ctrl+c/ctrl+d on an empty prompt box, false
+   * otherwise -- drives `NotificationLine`'s own "Press ctrl+c again to exit." row. A dedicated atom
+   * rather than reusing `error` (an earlier version did): this needed its own fixed-height row that
+   * can never collide with a REAL error needing the same row at the same time, and conflating the
+   * two meant a genuine error arriving during the exit-arm window would silently clobber (or be
+   * clobbered by) the exit notice instead of both being handled predictably. */
+  exitArmed: Atom<boolean>;
   /** Ctrl+O toggles this -- false (the default) collapses multi-line tool-result messages in the
    * transcript to their first line. */
   toolOutputExpanded: Atom<boolean>;
@@ -121,6 +130,29 @@ interface SessionAtoms {
   thinkingExpanded: Atom<boolean>;
   /** Which "/command" picker overlay (if any) currently owns the keyboard instead of PromptInput. */
   overlay: Atom<OverlayState | undefined>;
+  /** The mounted `CommandOverlay`'s own REAL measured height (via ink's `measureElement`, reported
+   * up through its `onHeightChange` prop) -- `TranscriptView` reads this instead of guessing, since
+   * an overlay's actual height varies wildly by phase and list length (anywhere from one "Loading…"
+   * line to a dozen-plus rows for a long, scrolled `SelectList`). A fixed guess here was a real,
+   * reported bug: whenever the guess didn't match reality (nearly always), the mismatch became
+   * either slack space or overflow between the overlay and the status bar, so the status bar visibly
+   * shifted position as the overlay's real content changed (switching phases, scrolling a list).
+   * Seeded with a small placeholder before the very first post-mount measurement lands -- harmless
+   * since `measureElement` only works after layout, and the correction happens synchronously in the
+   * same commit (`useLayoutEffect`, not `useEffect`) before anything is actually written to the
+   * terminal. */
+  overlayHeight: Atom<number>;
+  /** Rows scrolled UP from the very bottom of the transcript -- `0` means "pinned to the newest
+   * content" (the normal, default state). Driven by `mouse.ts`'s `onWheel` (a real, reported gap:
+   * this app used to capture wheel-scroll input at all, so a user's own instinct to scroll up and
+   * re-read older, clipped content just triggered the TERMINAL's own scroll instead, which does
+   * nothing useful inside the alternate screen buffer -- see mouse.ts's own header comment). Reset
+   * to `0` whenever the user submits a new prompt (PromptInput's `handleSubmit`) -- matches ordinary
+   * chat-app behavior: sending a message is a clear "show me what happens now" signal, but merely
+   * RECEIVING streamed text while scrolled up does NOT yank the view back down, so a user can keep
+   * reading history while a response streams in. `Transcript` (transcript.tsx) clamps this against
+   * the real, measured content height itself -- this atom can go arbitrarily high without issue. */
+  scrollOffset: Atom<number>;
   /** Bumped after "/model" or "/effort" mutates `session.state.model`/`.thinkingLevel` directly --
    * those are plain fields (see session/compaction.ts's own comment on why), so nothing else
    * naturally re-renders StatusLine when they change; this atom exists purely to trigger that
@@ -168,11 +200,14 @@ function createSessionAtoms(session: Session): SessionAtoms {
     streamingText: atom<string | undefined>(undefined),
     busy: atom(false),
     error: atom<string | undefined>(undefined),
+    exitArmed: atom(false),
     toolOutputExpanded: atom(false),
     // Visible by default, matching pi's own thinking toggle -- ctrl+t hides it, not the other way
     // around (decisions/0014-header-menu-and-editing.md's pi-parity follow-up).
     thinkingExpanded: atom(true),
     overlay: atom<OverlayState | undefined>(undefined),
+    overlayHeight: atom(3),
+    scrollOffset: atom(0),
     sessionVersion: atom(0),
     historyGeneration: atom(++nextHistoryGeneration),
     promptText: atom(""),
@@ -355,10 +390,26 @@ function RunningSession({
     };
   }, [session, atoms]);
 
+  // Wheel-scroll support (mouse.ts's own header comment covers the real gap this fixes) -- "up"
+  // scrolls further into history, "down" scrolls back toward the newest content. Clamped only at
+  // the bottom (`0`) here; the real top clamp depends on the transcript's own measured content
+  // height, which only `Transcript` (transcript.tsx) knows, so it re-clamps this value itself on
+  // every render rather than this effect needing to track that number too.
+  useEffect(() => {
+    return onWheel((direction) => {
+      const current = atoms.scrollOffset.get();
+      atoms.scrollOffset.set(direction === "up" ? current + 1 : Math.max(0, current - 1));
+    });
+  }, [atoms]);
+
   // `useApp()` is Ink's own context (from the real `render()` call in tui.tsx, which always wraps
   // whatever tree it's given in Ink's internal `<App>`) -- available here regardless of how deep
   // RunningSession sits under that root, no prop threading needed for it specifically.
   const { exit, suspendTerminal } = useApp();
+  // Only re-renders this component on an actual terminal RESIZE (rare), never on a keystroke -- the
+  // root `height={rows}` below is what makes the whole tree genuinely fullscreen, matching the real
+  // alternate-screen-buffer mode tui.tsx now enters before Ink ever renders a frame.
+  const { stdout } = useStdout();
   // Tracks whether the last ctrl+c (on an already-empty prompt box) is still within the
   // "press again to exit" window -- a plain ref, not an atom: nothing else in the tree ever reads
   // this value, only this one `useInput` closure across repeated calls.
@@ -414,7 +465,7 @@ function RunningSession({
         // arm the double-press-to-exit state, since the user is clearly still composing something.
         atoms.promptText.set("");
         atoms.commandMenuHighlight.set(0);
-        atoms.error.set(undefined);
+        atoms.exitArmed.set(false);
         exitArmedRef.current = false;
         return;
       }
@@ -425,13 +476,11 @@ function RunningSession({
         return;
       }
       exitArmedRef.current = true;
-      atoms.error.set("Press ctrl+c again to exit.");
+      atoms.exitArmed.set(true);
       clearTimeout(exitArmTimeoutRef.current);
       exitArmTimeoutRef.current = setTimeout(() => {
         exitArmedRef.current = false;
-        // Only clear the hint if it's still showing -- something else may have set a real error
-        // in the meantime, which this must not clobber.
-        if (atoms.error.get() === "Press ctrl+c again to exit.") atoms.error.set(undefined);
+        atoms.exitArmed.set(false);
       }, EXIT_ARM_WINDOW_MS);
     }
   });
@@ -471,65 +520,100 @@ function RunningSession({
   };
 
   return (
-    <Box flexDirection="column">
-      <TranscriptView
-        messagesAtom={atoms.messages}
-        localEntriesAtom={atoms.localEntries}
-        streamingTextAtom={atoms.streamingText}
-        toolOutputExpandedAtom={atoms.toolOutputExpanded}
-        thinkingExpandedAtom={atoms.thinkingExpanded}
-        historyGenerationAtom={atoms.historyGeneration}
-        version={version}
-      />
-      <ErrorLine errorAtom={atoms.error} />
-      <HorizontalRule />
-      {overlay ? (
-        <CommandOverlay
-          kind={overlay.kind}
-          arg={overlay.arg}
-          controller={slashCommands}
-          onDone={handleOverlayDone}
-          onCancel={() => atoms.overlay.set(undefined)}
-        />
-      ) : (
-        <PromptInput
-          session={session}
-          cwd={cwd}
-          busyAtom={atoms.busy}
-          errorAtom={atoms.error}
-          localEntriesAtom={atoms.localEntries}
+    <Box flexDirection="column" height={stdout?.rows ?? 24}>
+      {/* `flexShrink={0}` here matters even though `TranscriptView` already computes its own exact
+       * `height` -- without it, Yoga's default `flexShrink: 1` lets this box (and every footer
+       * element below) get proportionally SHRUNK, not just clipped, whenever the footer's actual
+       * total rendered height doesn't exactly match `footerHeight`'s own budget for it (see the
+       * footer's own `flexShrink={0}` wrapper below for when that real, reported bug happens and
+       * why). A shrunk `overflow="hidden"` box still clips cleanly on its own, but staying pinned to
+       * its own computed height keeps this box's `topAligned` math (transcript.tsx) trustworthy --
+       * it was derived assuming this exact height, not a Yoga-shrunk one. */}
+      <Box flexShrink={0}>
+        <TranscriptView
           messagesAtom={atoms.messages}
-          overlayAtom={atoms.overlay}
-          sessionVersionAtom={atoms.sessionVersion}
+          localEntriesAtom={atoms.localEntries}
+          toolOutputExpandedAtom={atoms.toolOutputExpanded}
+          thinkingExpandedAtom={atoms.thinkingExpanded}
+          historyGenerationAtom={atoms.historyGeneration}
           promptTextAtom={atoms.promptText}
           commandMenuHighlightAtom={atoms.commandMenuHighlight}
-          runShellCommand={runShellCommand}
-          slashCommands={slashCommands}
-          replaceSession={replaceSession}
-          spawnEditor={spawnEditor}
-          readClipboardImage={readClipboardImage}
-          readClipboardText={readClipboardText}
-          readDroppedFile={readDroppedFile}
+          overlayAtom={atoms.overlay}
+          overlayHeightAtom={atoms.overlayHeight}
+          scrollOffsetAtom={atoms.scrollOffset}
+          version={version}
         />
-      )}
-      <HorizontalRule />
-      {/* Below the prompt box's closing rule, same on-screen position as pi's own "/" menu -- a
-       * dedicated leaf component (not inline here) specifically so re-rendering it on every single
-       * keystroke -- unavoidable, since it has to track live-typed text -- never cascades into
-       * RunningSession's own re-render and, with it, TranscriptView/ErrorLine/StatusLine, the same
-       * fine-grained-atoms reasoning this file's header comment already states. No `overlay` gate
-       * needed: `PromptInput` always clears `promptTextAtom` before ever opening an overlay (see
-       * handleSubmit), so this naturally renders nothing while one is up. */}
-      <CommandMenuView
-        promptTextAtom={atoms.promptText}
-        commandMenuHighlightAtom={atoms.commandMenuHighlight}
-      />
-      <StatusLine
-        session={session}
-        cwd={cwd}
-        messagesAtom={atoms.messages}
-        sessionVersionAtom={atoms.sessionVersion}
-      />
+      </Box>
+      {/* `flexShrink={0}` on the whole footer group -- a REAL, reported bug lived here: every one of
+       * these elements defaulted to Yoga's `flexShrink: 1`, so whenever the group's actual combined
+       * height didn't exactly match `TranscriptView`'s own `footerHeight` budget for it (unavoidable
+       * for at least one render whenever an overlay's REAL measured height hasn't landed yet, see
+       * `CommandOverlay`'s own `onHeightChange` comment), Yoga didn't just let something overflow by
+       * a row -- it proportionally SHRANK every line of text in this group to fit, which for text
+       * content is not a clean partial clip but a garbled, characters-merged-onto-fewer-rows mess
+       * (confirmed live: "/effort"'s own two label lines partially overwrote each other on one row).
+       * `flexShrink={0}` makes the worst case a harmless one-row overflow past the terminal's bottom
+       * edge instead -- self-correcting the moment the real height catches up, exactly like this
+       * file's other accepted one-render-late estimates. */}
+      <Box flexShrink={0} flexDirection="column">
+        <NotificationLine
+          busyAtom={atoms.busy}
+          streamingTextAtom={atoms.streamingText}
+          exitArmedAtom={atoms.exitArmed}
+          errorAtom={atoms.error}
+        />
+        <HorizontalRule />
+        {overlay ? (
+          <CommandOverlay
+            kind={overlay.kind}
+            arg={overlay.arg}
+            controller={slashCommands}
+            onDone={handleOverlayDone}
+            onCancel={() => atoms.overlay.set(undefined)}
+            onHeightChange={(height) => atoms.overlayHeight.set(height)}
+          />
+        ) : (
+          <PromptInput
+            session={session}
+            cwd={cwd}
+            busyAtom={atoms.busy}
+            errorAtom={atoms.error}
+            localEntriesAtom={atoms.localEntries}
+            messagesAtom={atoms.messages}
+            overlayAtom={atoms.overlay}
+            sessionVersionAtom={atoms.sessionVersion}
+            promptTextAtom={atoms.promptText}
+            commandMenuHighlightAtom={atoms.commandMenuHighlight}
+            scrollOffsetAtom={atoms.scrollOffset}
+            runShellCommand={runShellCommand}
+            slashCommands={slashCommands}
+            replaceSession={replaceSession}
+            spawnEditor={spawnEditor}
+            readClipboardImage={readClipboardImage}
+            readClipboardText={readClipboardText}
+            readDroppedFile={readDroppedFile}
+          />
+        )}
+        <HorizontalRule />
+        {/* Below the prompt box's closing rule, same on-screen position as pi's own "/" menu -- a
+         * dedicated leaf component (not inline here) specifically so re-rendering it on every single
+         * keystroke -- unavoidable, since it has to track live-typed text -- never cascades into
+         * RunningSession's own re-render, the same fine-grained-atoms reasoning this file's header
+         * comment already states (TranscriptView/StatusLine each read only the specific atoms they
+         * need, the same discipline). No `overlay` gate needed: `PromptInput` always clears
+         * `promptTextAtom` before ever opening an overlay (see handleSubmit), so this naturally
+         * renders nothing while one is up. */}
+        <CommandMenuView
+          promptTextAtom={atoms.promptText}
+          commandMenuHighlightAtom={atoms.commandMenuHighlight}
+        />
+        <StatusLine
+          session={session}
+          cwd={cwd}
+          messagesAtom={atoms.messages}
+          sessionVersionAtom={atoms.sessionVersion}
+        />
+      </Box>
     </Box>
   );
 }
@@ -541,26 +625,48 @@ function messageTimestamp(message: AgentMessage): number {
 function TranscriptView({
   messagesAtom,
   localEntriesAtom,
-  streamingTextAtom,
   toolOutputExpandedAtom,
   thinkingExpandedAtom,
   historyGenerationAtom,
+  promptTextAtom,
+  commandMenuHighlightAtom,
+  overlayAtom,
+  overlayHeightAtom,
+  scrollOffsetAtom,
   version,
 }: {
   messagesAtom: Atom<AgentMessage[]>;
   localEntriesAtom: Atom<AgentMessage[]>;
-  streamingTextAtom: Atom<string | undefined>;
   toolOutputExpandedAtom: Atom<boolean>;
   thinkingExpandedAtom: Atom<boolean>;
   historyGenerationAtom: Atom<number>;
+  promptTextAtom: Atom<string>;
+  commandMenuHighlightAtom: Atom<number>;
+  overlayAtom: Atom<OverlayState | undefined>;
+  overlayHeightAtom: Atom<number>;
+  scrollOffsetAtom: Atom<number>;
   version: string;
 }) {
   const messages = useAtom(messagesAtom);
   const localEntries = useAtom(localEntriesAtom);
-  const streamingText = useAtom(streamingTextAtom);
   const toolOutputExpanded = useAtom(toolOutputExpandedAtom);
   const thinkingExpanded = useAtom(thinkingExpandedAtom);
   const historyGeneration = useAtom(historyGenerationAtom);
+  const scrollOffset = useAtom(scrollOffsetAtom);
+  // Read here (not just by PromptInput/CommandMenuView) specifically so THIS component's own
+  // footer-height math -- which decides `transcriptHeight` below -- always reflects the prompt
+  // box's/command menu's CURRENT size, not a stale one from before the keystroke that just grew or
+  // shrank it. Reading these atoms means this component now re-renders on every keystroke too, same
+  // as CommandMenuView already does -- but the expensive part of this component's own work
+  // (`buildTranscriptItems` over potentially many messages) is memoized below on `[merged,
+  // thinkingExpanded]` alone, so a keystroke that doesn't change `transcriptHeight` at all (the
+  // common case -- most keystrokes don't cross a line-wrap boundary) costs Ink nothing beyond a
+  // cheap prop-equality check, not a real re-layout of the transcript region.
+  const promptText = useAtom(promptTextAtom);
+  const commandMenuHighlight = useAtom(commandMenuHighlightAtom);
+  const overlay = useAtom(overlayAtom);
+  const overlayHeight = useAtom(overlayHeightAtom);
+  const { stdout } = useStdout();
   // Merged purely for display, by when each thing actually happened -- real conversation messages
   // and "!command" entries are never combined into one array anywhere else (session.state.messages
   // never sees the local ones at all, see SessionAtoms.localEntries's own comment).
@@ -568,20 +674,31 @@ function TranscriptView({
     () => [...messages, ...localEntries].sort((a, b) => messageTimestamp(a) - messageTimestamp(b)),
     [messages, localEntries],
   );
+
+  const rows = stdout?.rows ?? 24;
+  const promptOrOverlayHeight = overlay
+    ? overlayHeight
+    : promptBoxRowCount(promptText, stdout?.columns ?? 80);
+  const commandMenuHeight = overlay ? 0 : commandMenuRowCount(promptText, commandMenuHighlight);
+  // 1 (NotificationLine) + 1 (rule above the prompt box) + the prompt box/overlay itself + 1 (rule
+  // below it) + the live "/" menu, when open + 2 (the status bar's own two lines) -- see
+  // RunningSession's own render for the exact order these actually appear in.
+  const footerHeight = 1 + 1 + promptOrOverlayHeight + 1 + commandMenuHeight + 2;
+  const transcriptHeight = Math.max(1, rows - footerHeight);
+
   return (
     <Transcript
       // Forces a full remount on "/resume" -- see SessionAtoms.historyGeneration's own comment on
-      // why <Transcript>'s internal <Static> can't just keep growing across a wholesale history
-      // swap.
+      // why the transcript's own scroll-position bookkeeping can't just keep growing across a
+      // wholesale history swap.
       key={historyGeneration}
       messages={merged}
-      streamingText={streamingText}
       toolOutputExpanded={toolOutputExpanded}
       thinkingExpanded={thinkingExpanded}
-      // Settles into the SAME <Static> as every message, ahead of all of them -- see
-      // TranscriptProps.leadingStatic's own comment on why the banner can't have its own separate
-      // <Static> instead.
-      leadingStatic={<StartupBanner version={version} />}
+      leadingContent={<StartupBanner version={version} />}
+      leadingContentRows={BANNER_ROWS}
+      height={transcriptHeight}
+      scrollOffset={scrollOffset}
     />
   );
 }
@@ -623,10 +740,82 @@ function StatusLine({
   );
 }
 
-function ErrorLine({ errorAtom }: { errorAtom: Atom<string | undefined> }) {
+// A braille-dot spinner (the same general shape `pi` uses -- own glyph order/colors/timing, not a
+// port) cycling through a short color rotation as well as its own frames, purely so a long busy
+// stretch (a slow model, a long-running tool call) doesn't read as visually static/stuck the way a
+// single fixed color would. 80ms per frame is fast enough to read as "alive" without being so fast
+// it's distracting or costs a re-render more often than a human can actually perceive one.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_COLORS = ["cyan", "magenta", "yellow", "green", "blueBright"] as const;
+const SPINNER_INTERVAL_MS = 80;
+
+/** Advances a shared tick counter on an interval for as long as `active`, deriving both the current
+ * spinner glyph and its current color from it -- a single counter rather than two independent timers
+ * so the glyph cycle and the color cycle can never drift out of phase with each other. Stops (and
+ * the interval is cleared) the instant `active` goes false, rather than continuing to burn timer
+ * ticks for a spinner nothing is showing. */
+function useSpinnerFrame(active: boolean): {
+  glyph: string;
+  color: (typeof SPINNER_COLORS)[number];
+} {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const interval = setInterval(() => setTick((current) => current + 1), SPINNER_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [active]);
+  return {
+    glyph: SPINNER_FRAMES[tick % SPINNER_FRAMES.length],
+    color: SPINNER_COLORS[Math.floor(tick / SPINNER_FRAMES.length) % SPINNER_COLORS.length],
+  };
+}
+
+/** Fixed at exactly one terminal row (`height={1}`, regardless of which of its states is showing, or
+ * none) so switching between them never shifts the prompt box/status bar pinned right below it --
+ * the whole point of pulling this out of the transcript (where `streamingText` used to render) and
+ * out of a plain conditional `errorAtom` line (which came and went, shifting everything below it):
+ * matches Claude Code's own always-present, fixed-height notification row above its prompt box.
+ * Priority order when more than one could apply at once: the ctrl+c exit notice (a direct,
+ * time-boxed response to something the user just pressed) outranks the busy/spinner status (which
+ * can show for a much longer, open-ended stretch); a genuine error outranks both -- rare, but needs
+ * to actually be seen -- and is truncated to the terminal's own width rather than wrapped, since
+ * wrapping would grow this row past its fixed height. */
+function NotificationLine({
+  busyAtom,
+  streamingTextAtom,
+  exitArmedAtom,
+  errorAtom,
+}: {
+  busyAtom: Atom<boolean>;
+  streamingTextAtom: Atom<string | undefined>;
+  exitArmedAtom: Atom<boolean>;
+  errorAtom: Atom<string | undefined>;
+}) {
+  const busy = useAtom(busyAtom);
+  const streamingText = useAtom(streamingTextAtom);
+  const exitArmed = useAtom(exitArmedAtom);
   const error = useAtom(errorAtom);
-  if (!error) return null;
-  return <Text color="red">{error}</Text>;
+  const { stdout } = useStdout();
+  const { glyph, color } = useSpinnerFrame(busy);
+
+  const content = (() => {
+    if (exitArmed) return <Text color="yellow">Press ctrl+c again to exit.</Text>;
+    if (busy) {
+      return (
+        <Text>
+          <Text color={color}>{glyph}</Text> {streamingText ?? "working…"}
+        </Text>
+      );
+    }
+    if (error) {
+      const width = stdout?.columns ?? 80;
+      const truncated = error.length > width ? `${error.slice(0, Math.max(0, width - 1))}…` : error;
+      return <Text color="red">{truncated}</Text>;
+    }
+    return null;
+  })();
+
+  return <Box height={1}>{content}</Box>;
 }
 
 /** Builds the synthetic {user, toolResult} pair a "!command" produces for display -- shaped like a
@@ -744,6 +933,45 @@ const INIT_PROMPT =
   "conventions a coding agent should follow here. If AGENTS.md already exists, update it instead " +
   "of overwriting anything still accurate.";
 
+/** Every line's own marker ("> "/"… "/"  ") is exactly this many columns wide regardless of which
+ * one it actually is -- shared by `PromptInput`'s own cursor-positioning math (which needs the real
+ * marker text, since it's part of what's actually rendered) and `promptBoxRowCount` below (which
+ * only needs the WIDTH, for a layout calculation nowhere near PromptInput itself -- see that
+ * function's own comment). Kept as one named constant so the two never drift out of sync. */
+const PROMPT_MARKER_WIDTH = 2;
+
+/** How many terminal rows the ENTIRE prompt box (every line, not just up to the cursor) will occupy
+ * once wrapped at `columns` -- the piece of information `RunningSession`'s own full-terminal layout
+ * needs to size the transcript viewport around a prompt box whose height changes as the user
+ * composes a multi-line prompt (see `PromptInput`'s own `moveCursorVertically`/`visualRowsForLine`
+ * for the closely related, but cursor-position-aware, sibling calculation this deliberately does NOT
+ * reuse directly): replicates the exact same `wrap-ansi` call Ink itself uses internally
+ * (ink/build/wrap-text.js) so the row count matches pixel-for-pixel what's actually on screen, using
+ * a plain space run in place of each line's real marker text -- safe because the marker is always a
+ * non-space character immediately followed by a space (or two spaces), so it can never introduce a
+ * DIFFERENT word-wrap break point than an equal-width run of plain spaces would at any realistic
+ * terminal width. */
+function promptBoxRowCount(text: string, columns: number): number {
+  const width = Math.max(columns, 1);
+  return text.split("\n").reduce((total, line) => {
+    const wrapped = wrapAnsi(" ".repeat(PROMPT_MARKER_WIDTH) + line, width, {
+      trim: false,
+      hard: true,
+    });
+    return total + wrapped.split("\n").length;
+  }, 0);
+}
+
+/** The live "/" autocomplete menu's own rendered height (command-menu.tsx's own `MENU_WINDOW_SIZE`
+ * cap, plus its own trailing "(N/M)" position line) -- 0 when it isn't open at all. Mirrors
+ * `CommandMenuView`'s own `deriveCommandMenu` call exactly, so this never disagrees with what
+ * `CommandMenu` itself actually renders. */
+function commandMenuRowCount(promptText: string, highlightIndex: number): number {
+  const commandMenu = deriveCommandMenu(promptText, highlightIndex);
+  if (!commandMenu.open) return 0;
+  return Math.min(MENU_WINDOW_SIZE, commandMenu.matches.length) + 1;
+}
+
 /** Subscribes to `promptTextAtom`/`commandMenuHighlightAtom` and renders `CommandMenu` -- kept as
  * its own leaf component (see the call site's comment in RunningSession) so the fact that this
  * re-renders on literally every keystroke stays contained to just this small piece of the tree. */
@@ -772,6 +1000,7 @@ function PromptInput({
   sessionVersionAtom,
   promptTextAtom,
   commandMenuHighlightAtom,
+  scrollOffsetAtom,
   runShellCommand,
   slashCommands,
   replaceSession,
@@ -790,6 +1019,10 @@ function PromptInput({
   sessionVersionAtom: Atom<number>;
   promptTextAtom: Atom<string>;
   commandMenuHighlightAtom: Atom<number>;
+  /** Reset to `0` (pinned to the newest content) on every real submission -- see this atom's own
+   * comment on `SessionAtoms` for why sending a message, specifically, is what snaps the view back
+   * down. */
+  scrollOffsetAtom: Atom<number>;
   runShellCommand: RunShellCommand;
   slashCommands: SlashCommandController;
   replaceSession: (session: Session) => void;
@@ -800,6 +1033,7 @@ function PromptInput({
 }) {
   const busy = useAtom(busyAtom);
   const { suspendTerminal } = useApp();
+  const { stdout } = useStdout();
   // Promoted to a shared atom (rather than a plain local useState, otherwise this project's
   // default for text nothing else needs) specifically so CommandMenu -- a sibling `RunningSession`
   // renders below the prompt box's closing rule, not a child of this component -- can read it live,
@@ -837,7 +1071,129 @@ function PromptInput({
     const pos = clampCursor(cursorPos, current);
     promptTextAtom.set(current.slice(0, pos));
   };
+  const isWordChar = (ch: string) => !/\s/.test(ch);
+  /** Option+Delete's own behavior (matching Claude Code, VS Code, and every readline-based shell):
+   * deletes the word immediately behind the cursor in one chunk, rather than one character at a
+   * time -- skip any run of trailing whitespace first, then delete the run of non-whitespace behind
+   * that. Never crosses a "\n" into the previous line -- a "word" doesn't span lines, and silently
+   * joining two lines would be a surprising side effect of what looks like a plain delete. */
+  const deleteWordBeforeCursor = () => {
+    const current = promptTextAtom.get();
+    const pos = clampCursor(cursorPos, current);
+    let start = pos;
+    while (start > 0 && current[start - 1] !== "\n" && !isWordChar(current[start - 1])) start--;
+    while (start > 0 && current[start - 1] !== "\n" && isWordChar(current[start - 1])) start--;
+    if (start === pos) return;
+    promptTextAtom.set(current.slice(0, start) + current.slice(pos));
+    setCursorPos(start);
+  };
+  /** The symmetric forward direction (fn+Option+Delete on a Mac keyboard) -- same word-chunk
+   * behavior, just ahead of the cursor instead of behind it. The cursor position itself doesn't
+   * move, since nothing before it changed. */
+  const deleteWordAfterCursor = () => {
+    const current = promptTextAtom.get();
+    const pos = clampCursor(cursorPos, current);
+    let end = pos;
+    while (end < current.length && current[end] !== "\n" && !isWordChar(current[end])) end++;
+    while (end < current.length && current[end] !== "\n" && isWordChar(current[end])) end++;
+    if (end === pos) return;
+    promptTextAtom.set(current.slice(0, pos) + current.slice(end));
+  };
   const moveCursor = (delta: number) => setCursorPos((pos) => clampCursor(pos + delta, input));
+  /** Splits `text` into lines and locates `pos`'s (line, column) within them -- the one place this
+   * math is done, so the render below and up/down-arrow navigation (right below) can never disagree
+   * about where the caret visually sits. */
+  const locateCursor = (text: string, pos: number) => {
+    const lines = text.split("\n");
+    let remaining = clampCursor(pos, text);
+    let cursorLine = 0;
+    for (; cursorLine < lines.length - 1; cursorLine++) {
+      const lineLength = lines[cursorLine].length;
+      if (remaining <= lineLength) break;
+      remaining -= lineLength + 1; // +1 for the "\n" this line's own length doesn't count
+    }
+    return { lines, cursorLine, cursorCol: remaining };
+  };
+  /** Same 2-character width for every line's own marker ("> "/"… "/"  ") -- used below to convert
+   * between a column within a bare logical line and a column within what Ink actually wraps (marker
+   * + line, squashed into one `<Text>` per PromptInput's own render, see its header comment). */
+  const markerFor = (lineIndex: number) => (lineIndex === 0 ? (busy ? "… " : "> ") : "  ");
+  /** Ink wraps each line's rendered content (marker + text, squashed into one `<Text>`) via
+   * `wrap-ansi` internally (ink/build/wrap-text.js calls it with these exact options) -- replicating
+   * that here, with the SAME library and options, is what lets up/down-arrow navigation below land on
+   * the real VISUAL row Ink actually draws, not a naive character-count guess that would drift the
+   * moment a line contains spaces (word-wrap breaks earlier than a strict column cut would). Confirmed
+   * empirically that `{trim: false, hard: true}` never drops or reorders a single character -- joining
+   * the returned rows back together with no separator always reconstructs the original input exactly
+   * -- so every offset computed against these rows maps back to a real, exact position in `lines`.
+   */
+  const visualRowsForLine = (lineIndex: number, lines: string[]) => {
+    const width = Math.max(stdout.columns || 80, 1);
+    return wrapAnsi(markerFor(lineIndex) + lines[lineIndex], width, {
+      trim: false,
+      hard: true,
+    }).split("\n");
+  };
+  // Real, live-caught bug (round 1): up/down arrow were a total no-op for the prompt box (they only
+  // ever navigated the "/" autocomplete menu, see the useInput handler below) -- fine before
+  // multi-line composition existed, but once option+enter could put a real second line in the box,
+  // there was no way to move the caret vertically at all short of holding left-arrow across the whole
+  // line. Fixed by moving to the same column on the logical line above/below (split on real "\n"s).
+  //
+  // Real, live-caught bug (round 2, reported right after round 1 shipped): that logical-line-only fix
+  // was still a no-op on a single long line with no "\n" at all that nonetheless visually wraps across
+  // several terminal rows -- exactly the common case a real long prompt hits, and exactly what a user
+  // pressing up/down on one would expect to move through. Fixed by additionally tracking the VISUAL
+  // row within whichever logical line the caret is on (via `visualRowsForLine` above): up/down first
+  // tries to move within the CURRENT logical line's own wrapped rows, and only falls through to the
+  // adjacent logical line (landing on ITS nearest visual row -- last row moving up, first row moving
+  // down) once already at that line's own top/bottom visual row. A single unwrapped line still behaves
+  // exactly like round 1's fix (its own "rows" array is just itself, one entry).
+  const moveCursorVertically = (direction: -1 | 1) => {
+    const current = promptTextAtom.get();
+    const { lines, cursorLine, cursorCol } = locateCursor(current, cursorPos);
+    const lineStartOffset = (lineIndex: number) => {
+      let offset = 0;
+      for (let i = 0; i < lineIndex; i++) offset += lines[i].length + 1;
+      return offset;
+    };
+    // Where the caret sits within its own logical line's wrapped rows (marker included in the
+    // offset, since the marker occupies real columns Ink actually renders it into).
+    const ownRows = visualRowsForLine(cursorLine, lines);
+    let remaining = markerFor(cursorLine).length + cursorCol;
+    let visualRow = 0;
+    for (; visualRow < ownRows.length - 1; visualRow++) {
+      if (remaining <= ownRows[visualRow].length) break;
+      remaining -= ownRows[visualRow].length; // no "+1": wrap-ansi's own break isn't a real character
+    }
+    const visualCol = remaining;
+    // Converts a (rows, targetVisualRow, desiredVisualCol) triple back into a real flat cursorPos
+    // for `lineIndex`, clamping the column to that row's own length and stripping the marker's
+    // contribution back out (it only ever appears once, on row 0, so subtracting it once is correct
+    // regardless of which row the result lands on).
+    const flatPosFor = (
+      lineIndex: number,
+      rows: string[],
+      targetVisualRow: number,
+      desiredCol: number,
+    ) => {
+      const clampedCol = Math.min(desiredCol, rows[targetVisualRow].length);
+      let combined = clampedCol;
+      for (let i = 0; i < targetVisualRow; i++) combined += rows[i].length;
+      return lineStartOffset(lineIndex) + Math.max(0, combined - markerFor(lineIndex).length);
+    };
+
+    const targetVisualRow = visualRow + direction;
+    if (targetVisualRow >= 0 && targetVisualRow < ownRows.length) {
+      setCursorPos(flatPosFor(cursorLine, ownRows, targetVisualRow, visualCol));
+      return;
+    }
+    const targetLine = cursorLine + direction;
+    if (targetLine < 0 || targetLine >= lines.length) return; // already at the very top/bottom row
+    const targetRows = visualRowsForLine(targetLine, lines);
+    const targetVisualRowIndex = direction === -1 ? targetRows.length - 1 : 0;
+    setCursorPos(flatPosFor(targetLine, targetRows, targetVisualRowIndex, visualCol));
+  };
   // A prior `replaceInput`/RunningSession-side clear can shrink `input` out from under a cursor
   // that was further right -- clamp on every render rather than trusting callers to remember to.
   const safeCursorPos = clampCursor(cursorPos, input);
@@ -1035,6 +1391,10 @@ function PromptInput({
     const text = value.trim();
     const images = pendingImagesRef.current;
     if (!text && images.length === 0) return;
+    // Every real submission (a queued follow-up, a "!"/"!!" shell command, a "/" command, or an
+    // ordinary chat message) snaps the view back to the newest content -- see `scrollOffsetAtom`'s
+    // own comment on `SessionAtoms` for why sending a message specifically is the reset trigger.
+    scrollOffsetAtom.set(0);
     // Matches Claude Code: typing while a turn is in flight and pressing Enter queues the message
     // instead of being silently ignored -- Session.followUp() (packages/agent/src/agent.ts) is
     // already wired into the agent loop's own polling (agent-loop.ts's getFollowUpMessages hook),
@@ -1254,14 +1614,30 @@ function PromptInput({
   };
 
   useInput((char, key) => {
-    // Escape interrupts an in-flight turn, matching pi's own Escape-to-interrupt -- checked first,
-    // ahead of the menu's own Escape-clears-input behavior below, since interrupting a running
-    // generation is the more urgent of the two if a user somehow triggers both at once (typing "/"
-    // while a previous turn is still streaming). `session.abort()` (packages/agent/src/agent.ts)
-    // aborts the in-flight run's AbortSignal; the loop's own `withRunLifecycle` catches that and
-    // still emits a normal `agent_end` (with a synthetic `stopReason: "aborted"` message appended
-    // to history) -- RunningSession's existing `agent_end` handler already resets `busy` to false
-    // for that, so no extra plumbing is needed here beyond just calling `abort()`.
+    // Escape's meaning depends on what's actually in front of the user, checked in order from most
+    // to least local -- only once there's nothing left to back out of locally does it fall through
+    // to the global "interrupt the running turn" behavior. Two real, reported bugs came from this
+    // being wrong: (1) an open "/" menu got closed AFTER a busy-abort check that never let it run,
+    // and (2) even with (1) fixed, typing a command's FULL exact name (e.g. "/model") already closes
+    // `commandMenu.open` on its own (deriveCommandMenu -- an exact match has nothing left to
+    // disambiguate), so a plain "escape while composing a command" with no menu open at all still
+    // fell through to the busy-abort branch and killed an in-flight turn the user only meant to stop
+    // typing into, not interrupt.
+    if (key.escape && commandMenu.open) {
+      replaceInput(""); // backs out of composing a slash command, same as pi's own menu
+      return;
+    }
+    if (key.escape && input.length > 0) {
+      replaceInput(""); // clears whatever's typed -- covers the exact-match case above, and any
+      // other uncommitted text -- before ever reaching for the more drastic "abort the turn" below.
+      return;
+    }
+    // `session.abort()` (packages/agent/src/agent.ts) aborts the in-flight run's AbortSignal; the
+    // loop's own `withRunLifecycle` catches that and still emits a normal `agent_end` (with a
+    // synthetic `stopReason: "aborted"` message appended to history) -- RunningSession's existing
+    // `agent_end` handler already resets `busy` to false for that, so no extra plumbing is needed
+    // here beyond just calling `abort()`. Only reachable once the box is genuinely empty -- matches
+    // pi's own Escape-to-interrupt, but only when there's nothing local left to cancel first.
     if (key.escape && busy) {
       session.abort();
       return;
@@ -1273,6 +1649,15 @@ function PromptInput({
     // only way a newline ever reached the box).
     if (key.meta && key.return) {
       insertAtCursor("\n");
+      return;
+    }
+    // Option+Delete deletes the previous word in one chunk, matching Claude Code -- confirmed via
+    // ink/build/parse-keypress.js that a real terminal's ESC-prefixed DEL/BS reliably sets
+    // `key.meta` on a `backspace` key, exactly the same way ESC-prefixed Enter already does above.
+    // fn+Option+Delete (forward direction) gets the same treatment for free, symmetrically.
+    if (key.meta && (key.backspace || key.delete)) {
+      if (key.backspace) deleteWordBeforeCursor();
+      else deleteWordAfterCursor();
       return;
     }
     // Option+up pulls every currently-queued message (steering AND follow-up) back into the box
@@ -1340,6 +1725,10 @@ function PromptInput({
       commandMenuHighlightAtom.set(next);
       return;
     }
+    if (key.upArrow || key.downArrow) {
+      moveCursorVertically(key.upArrow ? -1 : 1);
+      return;
+    }
 
     if (key.return) {
       // Enter on an open menu immediately DISPATCHES the highlighted command (zero args) rather
@@ -1367,10 +1756,6 @@ function PromptInput({
       deleteBeforeCursor();
       return;
     }
-    if (key.escape && commandMenu.open) {
-      replaceInput(""); // backs out of composing a slash command, same as pi's own menu
-      return;
-    }
     if (key.leftArrow) {
       moveCursor(-1);
       return;
@@ -1387,7 +1772,7 @@ function PromptInput({
       setCursorPos(input.length);
       return;
     }
-    if (key.upArrow || key.downArrow || key.pageUp || key.pageDown || key.tab || key.escape) {
+    if (key.pageUp || key.pageDown || key.tab || key.escape) {
       return; // no message history yet -- just don't insert these as literal text
     }
     // Pressing space right after typing out "/effort" in full (nothing after it yet, cursor at
@@ -1427,20 +1812,27 @@ function PromptInput({
   // which Ink's row-flex layout does not stack the way a real multi-line text area would. Only the
   // FIRST line gets the "> "/"… " prompt marker; continuation lines indent under it instead of
   // repeating it, the same gutter convention transcript.tsx's tool cells already use for code.
-  const lines = input.split("\n");
-  let remaining = safeCursorPos;
-  let cursorLine = 0;
-  for (; cursorLine < lines.length - 1; cursorLine++) {
-    const lineLength = lines[cursorLine].length;
-    if (remaining <= lineLength) break;
-    remaining -= lineLength + 1; // +1 for the "\n" this line's own length doesn't count
-  }
-  const cursorCol = remaining;
+  //
+  // A real, live-caught bug lived here: each line used to be a `<Box>` (row) whose marker/before-
+  // cursor/cursor-char/after-cursor pieces were SIBLING `<Text>` elements. Ink lays out sibling
+  // `<Text>` nodes inside a `<Box>` as independent yoga nodes, each wrapping its OWN content against
+  // its OWN computed width -- see ink/build/render-node-to-output.js's own per-`ink-text` branch,
+  // which calls `wrapText` per node, not once for the whole row. Once a single logical line got long
+  // enough to actually wrap (no explicit "\n" needed, just length), moving the cursor changed the
+  // "before"/"after" slice lengths, which reshuffled each piece's OWN independent wrap point --
+  // producing exactly the visible reflow/garbling a real cursor move should never cause. Ink's own
+  // `squashTextNodes` (ink/build/squash-text-nodes.js) exists specifically to merge NESTED `<Text>`
+  // children of a single parent `<Text>` into one string before wrapping it once, as one unit
+  // (its own comment cites ink-link needing exactly this) -- so the fix is nesting every piece of a
+  // line inside ONE parent `<Text>` per line instead of a `<Box>` of sibling `<Text>`s, letting Ink
+  // wrap the whole line (marker included) as a single continuous flow with the cursor's inverse
+  // styling carried through the wrap correctly, wherever it lands.
+  const { lines, cursorLine, cursorCol } = locateCursor(input, safeCursorPos);
   return (
     <Box flexDirection="column">
       {lines.map((line, index) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: `lines` is rebuilt fresh from `input` on every render, never reordered or spliced -- index is a stable, sufficient key here.
-        <Box key={index}>
+        <Text key={index}>
           <Text color={busy ? "gray" : "green"}>{index === 0 ? (busy ? "… " : "> ") : "  "}</Text>
           {index === cursorLine ? (
             <>
@@ -1454,7 +1846,7 @@ function PromptInput({
           {index === lines.length - 1 && placeholder !== undefined && (
             <Text dimColor>{placeholder}</Text>
           )}
-        </Box>
+        </Text>
       ))}
     </Box>
   );

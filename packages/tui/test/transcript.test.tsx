@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@nanocode/agent";
+import { Text } from "ink";
 import { render } from "ink-testing-library";
 import { describe, expect, it } from "vitest";
 import {
@@ -252,37 +253,98 @@ describe("buildTranscriptItems", () => {
 });
 
 describe("Transcript (rendered)", () => {
-  it("renders without crashing and shows nothing but the streaming line when there are no messages yet", () => {
-    const { lastFrame } = render(<Transcript messages={[]} />);
-    expect(lastFrame()).toBe("");
+  // No more `<Static>`: `Transcript` is now a FIXED-height (`height` -- a required prop), clipped
+  // viewport (`overflow="hidden"`), matching a real chat window inside the alternate screen buffer
+  // this app now runs in (see transcript.tsx's own header comment for the full "why"). Whether a
+  // conversation TOP-ALIGNS (blank space left below it, like a chat window that hasn't scrolled)
+  // or BOTTOM-ANCHORS (oldest content clipped off the top, newest always kept) depends purely on
+  // whether `estimateItemRows`' rough total fits within `height` -- there is no "N earlier entries"
+  // indicator of any kind in either mode.
+
+  it("renders a blank fixed-height viewport (no crash) when there are no messages, no streamingText, and no leadingContent", () => {
+    const { lastFrame } = render(<Transcript messages={[]} height={5} />);
+    expect((lastFrame() ?? "").trim()).toBe("");
   });
 
-  it("renders every message when history is short", () => {
+  it("renders every message when the conversation comfortably fits within height", () => {
     const messages = [userMessage("hi there", 1), assistantTextMessage("42", 2)];
-    const { lastFrame } = render(<Transcript messages={messages} />);
+    const { lastFrame } = render(<Transcript messages={messages} height={20} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("hi there");
     expect(frame).toContain("42");
   });
 
-  it("shows every message, however long the conversation, with no hidden-count indicator at all -- the whole point of switching to <Static>", () => {
-    const messages = Array.from({ length: 100 }, (_, i) => userMessage(`line ${i}`, i));
-    const { lastFrame } = render(<Transcript messages={messages} />);
+  it("top-aligns a short conversation that fits within height, leaving real blank rows below it instead of bottom-anchoring", () => {
+    // Regression for a real, live-caught bug (see transcript.tsx's own `Transcript` comment): a
+    // `flex-end`-only version of this component bottom-anchored EVERY conversation, even one with
+    // nothing to clip at all -- which visually shoved a short conversation all the way to the
+    // bottom of the viewport instead of leaving it at the top, the way a chat window that hasn't
+    // filled its own history yet always does.
+    const { lastFrame } = render(
+      <Transcript messages={[userMessage("only message", 1)]} height={10} />,
+    );
+    const lines = (lastFrame() ?? "").split("\n");
+    const contentIndex = lines.findIndex((line) => line.includes("only message"));
+    expect(contentIndex).toBeGreaterThanOrEqual(0);
+    // Top-aligned: the message sits near the top, with genuine blank rows still left below it
+    // inside the fixed-height box, including the box's own last row.
+    expect(contentIndex).toBeLessThan(lines.length - 1);
+    expect(lines[lines.length - 1]?.trim() ?? "").toBe("");
+  });
+
+  it("bottom-anchors and clips the OLDEST messages off the top once the conversation overflows height, always keeping the newest -- no hidden-count indicator of any kind", () => {
+    const messages = Array.from({ length: 10 }, (_, i) =>
+      userMessage(i === 0 ? "first" : i === 9 ? "tenth" : `middle ${i}`, i),
+    );
+    const { lastFrame } = render(<Transcript messages={messages} height={6} />);
     const frame = lastFrame() ?? "";
     expect(frame).not.toMatch(/hidden/i);
     expect(frame).not.toMatch(/earlier/i);
-    expect(frame).toContain("line 0"); // the very first message is still reachable
-    expect(frame).toContain("line 99"); // as is the most recent one
+    expect(frame).toContain("tenth"); // the newest message is always reachable
+    expect(frame).not.toContain("first"); // the oldest is clipped off the top, not squeezed in
+  });
+
+  it("shows leadingContent when there's room, but clips it off first -- before any newer real message -- once the conversation overflows", () => {
+    const banner = <Text>BANNER-CONTENT</Text>;
+
+    const fitsFrame =
+      render(
+        <Transcript
+          messages={[userMessage("hello", 1)]}
+          leadingContent={banner}
+          leadingContentRows={3}
+          height={20}
+        />,
+      ).lastFrame() ?? "";
+    expect(fitsFrame).toContain("BANNER-CONTENT");
+    expect(fitsFrame).toContain("hello");
+
+    const manyMessages = Array.from({ length: 10 }, (_, i) => userMessage(`msg ${i}`, i));
+    const overflowFrame =
+      render(
+        <Transcript
+          messages={manyMessages}
+          leadingContent={banner}
+          leadingContentRows={3}
+          height={6}
+        />,
+      ).lastFrame() ?? "";
+    expect(overflowFrame).not.toContain("BANNER-CONTENT"); // the oldest content, clipped first
+    expect(overflowFrame).toContain("msg 9"); // the newest message is still reachable
   });
 
   it("renders in-progress streaming text separately from the settled message list", () => {
     const { lastFrame } = render(
-      <Transcript messages={[userMessage("go", 1)]} streamingText="thinking out loud…" />,
+      <Transcript
+        messages={[userMessage("go", 1)]}
+        streamingText="thinking out loud…"
+        height={20}
+      />,
     );
     expect(lastFrame()).toContain("thinking out loud…");
   });
 
-  it("renders streamingText verbatim, with no truncation, however long it is", () => {
+  it("renders streamingText verbatim, with no truncation, however long it is, given enough height", () => {
     // `Transcript` itself no longer bounds `streamingText`'s rendered height at all -- that was
     // tried once (a `boundStreamingPreview` helper, now deleted) and rejected: it only masked a
     // real, user-visible one-time "grows to the bounded cap, then stops" shift right at the start
@@ -290,13 +352,16 @@ describe("Transcript (rendered)", () => {
     // app.tsx instead: the only real caller now only ever passes a short FIXED status string
     // ("thinking..."/"responding…"), never the message's own growing text, so nothing here needs
     // to truncate anything ever again. This just proves `Transcript` renders whatever string it's
-    // given as-is, unmangled, whether short or long.
+    // given as-is, unmangled, whether short or long -- given a `height` tall enough to fit it (an
+    // overflowing `height` would legitimately clip it, per this describe block's other tests).
     const longResponse = [
       "Once upon a time in a small coastal town there lived a curious engineer who spent every evening tinkering with old radios and half broken clocks, always searching for the one missing gear.",
       "Every morning she would walk down to the harbor and watch the fishing boats leave before sunrise, thinking about the problem she had been chasing for weeks.",
     ].join("\n\n");
 
-    const { lastFrame } = render(<Transcript messages={[]} streamingText={longResponse} />);
+    const { lastFrame } = render(
+      <Transcript messages={[]} streamingText={longResponse} height={20} />,
+    );
     const frame = lastFrame() ?? "";
 
     expect(frame).toContain("Once upon a time");
@@ -304,15 +369,15 @@ describe("Transcript (rendered)", () => {
     expect(frame).toContain("fishing boats leave before sunrise");
   });
 
-  it("never truncates non-tool-cell messages, regardless of toolOutputExpanded", () => {
+  it("never truncates non-tool-cell messages, regardless of toolOutputExpanded, given enough height", () => {
     const messages = [userMessage("line one\nline two", 1)];
-    const { lastFrame } = render(<Transcript messages={messages} />);
+    const { lastFrame } = render(<Transcript messages={messages} height={20} />);
     expect(lastFrame()).toContain("line two");
   });
 
   it("collapsed tool cell shows only its one-line summary -- no output at all", () => {
     const messages = [toolResultMessage("line one\nline two\nline three", 1)];
-    const { lastFrame } = render(<Transcript messages={messages} />);
+    const { lastFrame } = render(<Transcript messages={messages} height={20} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("ipython");
     expect(frame).toContain("ctrl+o to expand");
@@ -323,7 +388,7 @@ describe("Transcript (rendered)", () => {
 
   it("expanded tool cell shows the full output, with ctrl+o to collapse", () => {
     const messages = [toolResultMessage("line one\nline two\nline three", 1)];
-    const { lastFrame } = render(<Transcript messages={messages} toolOutputExpanded />);
+    const { lastFrame } = render(<Transcript messages={messages} toolOutputExpanded height={20} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("line one");
     expect(frame).toContain("line two");
@@ -342,14 +407,89 @@ describe("Transcript (rendered)", () => {
       timestamp: 1,
     } as AgentMessage;
 
-    const collapsedFrame = render(<Transcript messages={[message]} />).lastFrame() ?? "";
+    const collapsedFrame =
+      render(<Transcript messages={[message]} height={20} />).lastFrame() ?? "";
     expect(collapsedFrame).not.toContain("secret reasoning");
     expect(collapsedFrame).toContain("final answer");
 
     const expandedFrame =
-      render(<Transcript messages={[message]} thinkingExpanded />).lastFrame() ?? "";
+      render(<Transcript messages={[message]} thinkingExpanded height={20} />).lastFrame() ?? "";
     expect(expandedFrame).toContain("secret reasoning");
     expect(expandedFrame).toContain("final answer");
+  });
+});
+
+describe("Transcript scrollOffset", () => {
+  // `scrollOffset` (transcript.tsx's own header comment on `Transcript` covers the full mechanism):
+  // rows scrolled UP from the newest content, clamped by `Transcript` itself against its own REAL
+  // `measureElement`-reported content height (never the rough `estimateItemRows` seed) -- so every
+  // test below builds enough messages to force a real overflow, and relies on `render()` having
+  // already flushed the `useLayoutEffect` measurement pass by the time `lastFrame()` is read (this
+  // file's own pre-existing "bottom-anchors and clips" test above already depends on exactly that
+  // same synchronous-measurement behavior with no extra `await`/rerender needed, confirmed by it
+  // already passing).
+
+  it("scrollOffset={0} (and the default, omitted) behave identically -- bottom-anchored to the newest content when overflowing", () => {
+    const messages = Array.from({ length: 10 }, (_, i) => userMessage(`msg ${i}`, i));
+
+    const defaultFrame = render(<Transcript messages={messages} height={6} />).lastFrame() ?? "";
+    const explicitZeroFrame =
+      render(<Transcript messages={messages} height={6} scrollOffset={0} />).lastFrame() ?? "";
+
+    expect(defaultFrame).toBe(explicitZeroFrame);
+    expect(defaultFrame).toContain("msg 9"); // newest still reachable
+    expect(defaultFrame).not.toContain("msg 0"); // oldest still clipped off the top
+  });
+
+  it("a scrollOffset large enough to reveal an earlier, otherwise-clipped item shows it without losing the clamp", () => {
+    const messages = Array.from({ length: 10 }, (_, i) => userMessage(`msg ${i}`, i));
+
+    const bottomFrame = render(<Transcript messages={messages} height={6} />).lastFrame() ?? "";
+    expect(bottomFrame).not.toContain("msg 0");
+
+    // Each user message is 3 rows tall (UserMessageBar's own blank-text-blank shape) with no
+    // marginBottom -- scrolling up by 15 rows (five messages' worth) comfortably reveals a message
+    // from the middle of the conversation that the bottom-anchored view above couldn't show at all.
+    const scrolledFrame =
+      render(<Transcript messages={messages} height={6} scrollOffset={15} />).lastFrame() ?? "";
+    expect(scrolledFrame).toContain("msg 4");
+  });
+
+  it("an extremely large scrollOffset clamps cleanly at the very top -- the first item (and leadingContent) visible, nothing crashes or duplicates", () => {
+    const banner = <Text>BANNER-CONTENT</Text>;
+    const messages = Array.from({ length: 10 }, (_, i) => userMessage(`msg ${i}`, i));
+
+    const { lastFrame } = render(
+      <Transcript
+        messages={messages}
+        leadingContent={banner}
+        leadingContentRows={3}
+        height={6}
+        scrollOffset={99999}
+      />,
+    );
+    const frame = lastFrame() ?? "";
+
+    expect(frame).toContain("BANNER-CONTENT");
+    expect(frame).toContain("msg 0");
+    // No duplication: each message's own distinguishing text appears exactly once in the frame.
+    expect(frame.split("msg 0").length - 1).toBe(1);
+    expect(frame.split("BANNER-CONTENT").length - 1).toBe(1);
+  });
+
+  it("a nonzero scrollOffset has no visible effect when content fits entirely within height -- nothing to scroll, still top-aligned", () => {
+    const messages = [userMessage("only message", 1)];
+
+    const unscrolledFrame =
+      render(<Transcript messages={messages} height={10} />).lastFrame() ?? "";
+    const scrolledFrame =
+      render(<Transcript messages={messages} height={10} scrollOffset={50} />).lastFrame() ?? "";
+
+    expect(scrolledFrame).toBe(unscrolledFrame);
+    const lines = scrolledFrame.split("\n");
+    const contentIndex = lines.findIndex((line) => line.includes("only message"));
+    expect(contentIndex).toBeGreaterThanOrEqual(0);
+    expect(contentIndex).toBeLessThan(lines.length - 1); // still top-aligned, blank rows still below
   });
 });
 

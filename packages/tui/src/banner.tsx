@@ -42,6 +42,12 @@ const LOGO_LINES = [
 export const COMPACT_HINT =
   "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · /help for keybindings";
 
+/** LOGO_LINES' own row count, plus the hint line, plus the round border's own top+bottom rows --
+ * exported so app.tsx's full-terminal-launch filler space (RunningSession's own `FillerSpace`) can
+ * compute exactly how many terminal rows this banner itself already accounts for, without either
+ * file having to keep a second, independently-maintained copy of this number in sync by hand. */
+export const BANNER_ROWS = LOGO_LINES.length + 1 + 2;
+
 export function StartupBanner(_: { version: string }) {
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>

@@ -1,17 +1,20 @@
-// Every settled message is ALWAYS visible, exactly like Claude Code's own terminal UI: scroll the
-// real terminal (or search its scrollback) to see anything earlier, rather than an app-level
-// "hidden count" the user has no way to reach. This used to be virtualized (only the tail of the
-// conversation that fit an estimated row budget was ever rendered, with a "N earlier entries hidden"
-// banner and no way to reach them) -- a real, reported UX problem: there was genuinely no way back to
-// hidden history. It's built on Ink's own `<Static>` (see `Transcript` below): every settled item
-// prints ONCE, permanently, directly to the real terminal stream, becoming real scrollback immune to
-// Ink's live-frame redraw/clear entirely -- not a home-grown virtualization scheme at all anymore.
-// hermes-ink's ScrollBox (an imperatively-scrollable viewport built on hermes-ink's own forked
-// reconciler and hand-ported Yoga engine) was considered and rejected for the same reason it always
-// has been: none of that exists in upstream Ink, and Static already solves the actual problem
-// (unbounded history without re-render cost or Ink's own large-frame full-clear behavior -- see
-// select-list.tsx's own comment on `shouldClearTerminalForFrame`) with a primitive Ink ships. See
-// decisions/0005-tui-stack.md and decisions/0014-header-menu-and-editing.md's Static follow-up.
+// Runs inside a real alternate-screen-buffer fullscreen mode now (packages/cli/src/tui.tsx enters
+// it before Ink ever renders a frame), matching Claude Code's own separate "fullscreen renderer"
+// mode -- the user's own explicit ask, after nanocode's earlier inline-scrollback approach (every
+// settled message printed once, permanently, via Ink's `<Static>`, becoming real terminal scrollback)
+// couldn't give a footer that stays pinned to the terminal's bottom edge once real conversation
+// content existed; it could only ever trail immediately behind whatever was last printed. The
+// alternate screen buffer has NO scrollback of its own at all, which is exactly why `<Static>` no
+// longer has any purpose here: `Transcript` (below) is instead a FIXED-height, clipped viewport
+// (`overflow="hidden"`, bottom-aligned children) that always shows however much of the tail of the
+// conversation fits in whatever height app.tsx's `TranscriptView` computes for it (terminal height
+// minus the notification line, prompt box, and status bar) -- auto-scrolling to the newest content
+// the same way a real chat window does, with older content clipped off the top rather than hidden
+// behind an app-level "N earlier entries" count. hermes-ink's ScrollBox (an imperatively-scrollable
+// viewport built on hermes-ink's own forked reconciler and hand-ported Yoga engine) was considered
+// and rejected for the same reason it always has been: none of that exists in upstream Ink, and this
+// file's own clipping technique (see `Transcript`'s own comment) achieves the same real result with
+// primitives Ink already ships.
 //
 // Rendering shape (decisions/0014-header-menu-and-editing.md's pi-parity follow-up): a real assistant
 // turn can contain thinking, one or more tool calls, and final text all in one AgentMessage's content
@@ -20,27 +23,17 @@
 // first flattens the raw message list into a `TranscriptItem[]` (one item per thing that actually gets
 // its own visual treatment: a user turn, a thinking block, one tool call paired with its eventual
 // result, or one span of final assistant text), pairing each toolCall content block with its
-// ToolResultMessage sibling by id along the way. `Transcript` then feeds that flattened list straight
-// into `<Static>`, unfiltered and unbudgeted.
+// ToolResultMessage sibling by id along the way.
 //
-// Two consequences of `<Static>` freezing each item's rendered output the FIRST time it's ever part
-// of the "new" tail slice, permanently, worth knowing before touching this file:
-// 1. `ctrl+o`/`ctrl+t` only affect items that haven't been frozen into real scrollback yet -- exactly
-//    matching a real terminal (you can't retroactively repaint history that already scrolled past).
-//    Toggling either one only changes how NEW items render from that point on.
-// 2. A toolCall content block is only ever turned into an item once its ToolResultMessage sibling has
-//    actually arrived (see `buildTranscriptItems` below) -- never while `isPending` in the old sense.
-//    Freezing a "still running" cell into Static would make it stay "still running" forever even
-//    after the real result lands one render later, since Static would never revisit that slot to
-//    update it. The still-executing window is covered by the existing coarse `streamingText`
-//    "[running <tool>…]" status line instead (app.tsx's `tool_execution_start` handler), not by a
-//    tool cell. One accepted, narrow gap from this: a tool call interrupted mid-execution (whose
-//    ToolResultMessage never arrives at all) never gets a cell of its own -- the interrupt is still
-//    communicated (an error line / the next turn's own content), just not as a frozen "it was running
-//    this" cell, which would otherwise be equally possible to freeze BEFORE or AFTER the real result
-//    with no way to tell which from inside a pure per-render item builder.
+// A toolCall content block is only ever turned into an item once its ToolResultMessage sibling has
+// actually arrived (see `buildTranscriptItems` below) -- never while still executing. The
+// still-executing window is covered by app.tsx's `NotificationLine` (a fixed status line + spinner,
+// not part of this file at all) instead of a tool cell of its own. One accepted, narrow gap from
+// this: a tool call interrupted mid-execution (whose ToolResultMessage never arrives at all) never
+// gets a cell of its own -- the interrupt is still communicated (an error line / the next turn's own
+// content), just not as its own "it was running this" cell.
 import type { AgentMessage } from "@nanocode/agent";
-import { Box, Static, Text, useStdout } from "ink";
+import { Box, type DOMElement, measureElement, Text, useStdout } from "ink";
 import type { ReactNode } from "react";
 // See app.tsx's comment on why this file needs an explicit REAL (not `import type`) React import
 // despite the automatic JSX runtime being configured and packages/tui having its own local
@@ -49,7 +42,7 @@ import type { ReactNode } from "react";
 // autofixer narrowing "only used as a type" can't quietly turn this one into `import type` too
 // (confirmed live: it did exactly that once, silently, before this comment existed).
 // biome-ignore lint/correctness/noUnusedImports: required by tsx's runtime JSX transform, not referenced directly in this file's own code
-import React from "react";
+import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 /** A message's content can be a plain string (UserMessage) or a content-block array (every role);
  * this renders it down to the plain text a terminal transcript actually shows -- tool calls get a
@@ -560,79 +553,190 @@ function TranscriptItemView({
 export interface TranscriptProps {
   messages: readonly AgentMessage[];
   /** A FIXED status string ("thinking...", "responding…", "[running <tool>…]") for the one
-   * still-in-flight assistant message -- the one thing in this component that's still live/redrawn
-   * every frame rather than settled into `<Static>` (it isn't in `messages` yet at all). app.tsx
-   * (the only real caller) deliberately never hands this the message's own growing text anymore: an
-   * earlier version did, then tried bounding its rendered height here, but that still left a real,
-   * user-visible one-time "grows to the bounded cap, then stops" shift right as a response started
-   * -- still scrolling by the time a human actually sees it. A fixed string's height never changes
-   * at all, for the entire turn. Renders as plain unstyled text, matching the no-label final-answer
-   * treatment below. */
+   * still-in-flight assistant message -- it isn't in `messages` yet at all. app.tsx's own
+   * `NotificationLine` is what actually displays this now (alongside a spinner) -- kept as a prop
+   * here too only for the rare moment a caller wants it inline with the transcript itself; the real
+   * nanocode app no longer passes it in.
+   * deliberately never the message's own growing text: an earlier version did, then tried bounding
+   * its rendered height here, but that still left a real, user-visible one-time "grows to the
+   * bounded cap, then stops" shift right as a response started -- still scrolling by the time a
+   * human actually sees it. A fixed string's height never changes at all, for the entire turn. */
   streamingText?: string;
-  /** Ctrl+O toggles this (app.tsx). False (the default) collapses every NOT-YET-SETTLED tool cell to
-   * its one-line summary -- true expands new ones to their full code and output. A single global
-   * toggle, not a per-cell one -- and, because of `<Static>`, it only ever affects items that haven't
-   * been permanently rendered yet; see this file's header comment. */
+  /** Ctrl+O toggles this (app.tsx). False (the default) collapses every tool cell to its one-line
+   * summary -- true expands them to their full code and output. A single global toggle, applying
+   * uniformly to every item on every render now that nothing freezes into permanent scrollback
+   * (see this file's header comment) -- unlike the old `<Static>`-based version, toggling this now
+   * retroactively affects OLDER tool cells too, not just ones settled after the toggle. */
   toolOutputExpanded?: boolean;
-  /** Ctrl+T toggles this (app.tsx). False (the default) hides new thinking blocks entirely -- true
-   * shows new ones in full. Binary, matching pi's own thinking toggle, and -- like
-   * `toolOutputExpanded` -- only affects items not yet settled into `<Static>`. */
+  /** Ctrl+T toggles this (app.tsx). False (the default) hides thinking blocks entirely -- true shows
+   * them in full. Binary, matching pi's own thinking toggle -- like `toolOutputExpanded`, applies
+   * uniformly to every item now, old and new alike. */
   thinkingExpanded?: boolean;
-  /** Extra content to settle into this component's OWN `<Static>`, ahead of every message, exactly
-   * once, permanently (app.tsx's startup banner, once a session exists). NOT a second `<Static>` of
-   * its own: confirmed directly (a tiny isolated repro) that Ink does not support more than one
-   * `<Static>` per render tree at all -- a second, independent sibling `<Static>` silently produces
-   * NO output whatsoever, not a layout/ordering issue. Whatever else ever needs to become permanent
-   * scrollback above the transcript has to share this one instead of using its own. */
-  leadingStatic?: ReactNode;
+  /** Extra content shown ahead of every real message -- app.tsx's startup banner. Just the first
+   * child of the scrollable viewport now (this file's header comment covers why there's no more
+   * `<Static>` to settle it into): visible when scrolled to the very top of the conversation, like
+   * any chat app's own opening message, not a separately-pinned header taking up its own space
+   * forever. */
+  leadingContent?: ReactNode;
+  /** `leadingContent`'s own approximate row count (app.tsx passes `BANNER_ROWS` for the real
+   * startup banner) -- this component can't measure an arbitrary `ReactNode`'s rendered height
+   * itself, and needs SOME number for it to decide top-alignment vs. bottom-anchoring below.
+   * Defaults to 0 (assumed to take no space) if `leadingContent` is set but this isn't -- an
+   * intentionally forgiving default, not a hard requirement, since the consequence of this being
+   * wrong is only ever a one-render-late alignment flip (see this component's own header comment),
+   * never a crash or an actually-wrong clip. */
+  leadingContentRows?: number;
+  /** How many terminal rows this transcript gets -- app.tsx's `TranscriptView` computes this from
+   * the real terminal height minus everything else on screen (the notification line, the prompt
+   * box, the status bar, ...), so the transcript is always exactly what's left, never more. */
+  height: number;
+  /** Rows scrolled UP from the very bottom (the newest content) -- `0` (the default) means pinned to
+   * the bottom, exactly like before this prop existed. Driven by app.tsx's `mouse.ts`-backed wheel
+   * handling; see this component's own header comment for how a value here actually moves the
+   * visible window, and why arbitrarily large values are always safe to pass (this component clamps
+   * against its own real, measured content height itself). */
+  scrollOffset?: number;
 }
 
-/** One real `TranscriptItem` slot, or the one `leadingStatic` slot (if provided) -- both settle
- * through the SAME `<Static>` (see `TranscriptProps.leadingStatic`'s own comment on why there can
- * only be one). Kept internal to this file; `leadingStatic`'s caller never needs to know slots exist. */
-type StaticSlot = { kind: "leadingStatic" } | TranscriptItem;
+/** Rough, deliberately approximate row-count estimate for one item -- used ONLY as this component's
+ * very first-render SEED for `contentHeight` (see `Transcript` below), before its own
+ * `measureElement` pass has had a chance to run even once. Never used to compute an actual clip
+ * point or scroll position -- Yoga's own real layout (via `measureElement`) does that precisely,
+ * regardless of how far off this estimate is, and self-corrects within the same commit -- so a plain
+ * character-count wrap (this file's own `wrapPlainText`) is precise enough; no need for
+ * `wrap-ansi`'s real word-wrap here. */
+function estimateItemRows(
+  item: TranscriptItem,
+  width: number,
+  toolOutputExpanded: boolean,
+): number {
+  if (item.kind === "user") {
+    // Matches UserMessageBar's own shape: one blank bar-colored row above and below the text.
+    return wrapPlainText(item.text, Math.max(1, width - 1)).length + 2;
+  }
+  if (item.kind === "thinking") {
+    return item.hidden ? 0 : wrapPlainText(item.text, width).length;
+  }
+  if (item.kind === "toolCell") {
+    if (!toolOutputExpanded) return 1; // the collapsed one-line summary
+    const codeRows = item.code.length > 0 ? item.code.split("\n").length + 1 : 0;
+    const outputRows = item.output.length > 0 ? item.output.split("\n").length + 1 : 1;
+    return 1 + codeRows + outputRows;
+  }
+  // "assistantText" / "notice"
+  return wrapPlainText(item.text, width).length;
+}
 
-/** Every settled item renders through `<Static>` -- printed once, permanently, directly to the real
- * terminal (this file's header comment covers why, and the two behavioral consequences of freezing a
- * render this way). `key` is required on `<Static>`'s children per its own contract; a hidden
- * thinking item still occupies a slot in `items` (so `<Static>`'s length-based bookkeeping of "how
- * much have I already rendered" stays correct across a ctrl+t toggle) but renders as nothing at all,
- * so it needs no key of its own. */
+/** The scrollable chat viewport: a FIXED-height `<Box>` (`overflow="hidden"`) containing one
+ * naturally-sized (no explicit `height`) inner column `<Box>` holding every real item, shifted up or
+ * down via `marginTop` on that inner box -- the same technique any CSS-flexbox scrollable region
+ * uses without a native "scroll" primitive (confirmed via an isolated repro before wiring this in:
+ * an inner box taller than its `overflow: hidden` parent, given a negative `marginTop`, reveals
+ * exactly the window that margin implies -- clean, precise, and small enough deltas naturally support
+ * arbitrary scroll positions, not just "all the way top" or "all the way bottom").
+ *
+ * `contentHeight` (the inner box's real height) starts from `estimateItemRows`' rough total -- an
+ * intentionally-approximate SEED, since nothing has actually been measured yet on the very first
+ * render -- and is corrected to the real, exact value by `measureElement` inside a `useLayoutEffect`
+ * (ink's own recommended pattern for this: measurement only works post-layout, and `useLayoutEffect`
+ * lands the correction in the SAME commit, before anything is actually written to the terminal, the
+ * same technique `command-overlay.tsx`'s own height-reporting already uses). This replaced an
+ * earlier, ESTIMATE-only version that only ever picked between two fixed alignments (top-aligned
+ * when short, bottom-anchored-at-the-newest when overflowing) -- correct for those two cases, but
+ * with no way to represent anything IN BETWEEN, which is exactly what real, precise scrolling needs.
+ *
+ * `maxScroll = max(0, contentHeight - height)` is how far "up" there is to go at all; `scrollOffset`
+ * is clamped into `[0, maxScroll]` here (the only place that knows the real content height, so the
+ * only place that CAN clamp accurately) before being turned into `marginTop = -(maxScroll -
+ * clampedOffset)`. At `scrollOffset = 0` this reduces to the old bottom-anchored case exactly
+ * (`marginTop = -maxScroll`, revealing the tail); once `contentHeight <= height` (nothing to scroll),
+ * `maxScroll` is `0` and `marginTop` is always `0` regardless of `scrollOffset` -- the old
+ * top-aligned case, also exactly reproduced.
+ *
+ * There is still no OS/terminal-level scrollback reachable here, since the alternate screen buffer
+ * this all runs inside of has none of its own (see this file's header comment) -- but a user's own
+ * wheel scroll (app.tsx's `onWheel` subscription, fed by `mouse.ts`'s SGR mouse-report parsing) now
+ * moves within the SAME `scrollOffset` this component reads, so older content really is reachable
+ * again on demand, not just by resizing the terminal taller or clearing the conversation.
+ *
+ * Every real item still gets its own `flexShrink={0}` (below) for the same reason as before: without
+ * it, Yoga shrinks every child to share whatever space is available instead of clipping cleanly by
+ * position, which for text content produces nonsensical, sampled-looking output. A hidden thinking
+ * item renders as nothing at all (its own `key` still required by React, even though it contributes
+ * no visible row or margin -- `estimateItemRows`'s own seed-total skips it for the same reason). */
 export function Transcript({
   messages,
   streamingText,
   toolOutputExpanded = false,
   thinkingExpanded = false,
-  leadingStatic,
+  leadingContent,
+  leadingContentRows = 0,
+  height,
+  scrollOffset = 0,
 }: TranscriptProps) {
   const { stdout } = useStdout();
   const width = stdout?.columns ?? 80;
 
-  const items = buildTranscriptItems(messages, thinkingExpanded);
-  // `leadingStatic`'s own presence (not its content) decides whether slot 0 exists at all -- as
-  // long as the caller keeps passing SOMETHING once it starts passing anything, this slot's index
-  // stays 0 forever, which is all `<Static>`'s own length-based bookkeeping needs to stay correct.
-  const slots: StaticSlot[] =
-    leadingStatic !== undefined ? [{ kind: "leadingStatic" }, ...items] : items;
+  // Memoized on `[messages, thinkingExpanded]` alone (NOT `toolOutputExpanded`, which only affects
+  // how an already-built `ToolCellItem` is RENDERED, not which items exist at all) -- `TranscriptView`
+  // now re-renders this component on every keystroke (to keep `height` current, see its own
+  // comment), so recomputing this flattening pass every time regardless of whether `messages` itself
+  // changed would be real, avoidable, and potentially expensive-at-scale wasted work.
+  const items = useMemo(
+    () => buildTranscriptItems(messages, thinkingExpanded),
+    [messages, thinkingExpanded],
+  );
+
+  const estimatedContentRows = useMemo(() => {
+    let total = leadingContent !== undefined ? leadingContentRows : 0;
+    for (const item of items) {
+      if (item.kind === "thinking" && item.hidden) continue;
+      total += estimateItemRows(item, width, toolOutputExpanded);
+      if (item.kind !== "user") total += 1; // matches the real `marginBottom={1}` below
+    }
+    if (streamingText !== undefined) total += 1;
+    return total;
+  }, [items, leadingContent, leadingContentRows, width, toolOutputExpanded, streamingText]);
+
+  const [contentHeight, setContentHeight] = useState(estimatedContentRows);
+  const contentRef = useRef<DOMElement>(null);
+  useLayoutEffect(() => {
+    if (!contentRef.current) return;
+    const { height: measured } = measureElement(contentRef.current);
+    if (measured > 0) setContentHeight(measured);
+  });
+
+  const maxScroll = Math.max(0, contentHeight - height);
+  const clampedOffset = Math.min(Math.max(scrollOffset, 0), maxScroll);
+  const marginTop = -(maxScroll - clampedOffset);
 
   return (
-    <Box flexDirection="column">
-      <Static items={slots}>
-        {(slot) => {
-          if (slot.kind === "leadingStatic") return <Box key="leading-static">{leadingStatic}</Box>;
-          if (slot.kind === "thinking" && slot.hidden) return null;
+    <Box height={height} overflow="hidden" flexDirection="column">
+      <Box ref={contentRef} flexShrink={0} flexDirection="column" marginTop={marginTop}>
+        {leadingContent !== undefined && <Box flexShrink={0}>{leadingContent}</Box>}
+        {items.map((item) => {
+          if (item.kind === "thinking" && item.hidden) return null;
           return (
-            <Box key={slot.key} flexDirection="column" marginBottom={slot.kind === "user" ? 0 : 1}>
+            <Box
+              key={item.key}
+              flexShrink={0}
+              flexDirection="column"
+              marginBottom={item.kind === "user" ? 0 : 1}
+            >
               <TranscriptItemView
-                item={slot}
+                item={item}
                 width={width}
                 toolOutputExpanded={toolOutputExpanded}
               />
             </Box>
           );
-        }}
-      </Static>
-      {streamingText !== undefined && <Text>{streamingText}</Text>}
+        })}
+        {streamingText !== undefined && (
+          <Box flexShrink={0}>
+            <Text>{streamingText}</Text>
+          </Box>
+        )}
+      </Box>
     </Box>
   );
 }

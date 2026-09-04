@@ -14,7 +14,7 @@ import type { CommandInfo } from "./slash-commands.ts";
  * WINDOW_SIZE: an unbounded list (nanocode has 15 commands today) risks a frame tall enough that
  * ink's `shouldClearTerminalForFrame` treats it as a fullscreen frame and wipes the whole terminal
  * on every keystroke -- the exact bug that windowing was already added once to avoid. */
-const MENU_WINDOW_SIZE = 6;
+export const MENU_WINDOW_SIZE = 6;
 const MARKER_WIDTH = 2; // "→ " or "  "
 const NAME_COLUMN_WIDTH = 14;
 const GAP_WIDTH = 1; // the single space between the name column and the description

@@ -18,7 +18,14 @@ import {
   TrustStore,
 } from "@nanocode/agent";
 import { resolveModel, writeStoredModelSelection } from "@nanocode/ai";
-import { App, type ModelSetupController, type SlashCommandController } from "@nanocode/tui";
+import {
+  App,
+  MOUSE_DISABLE_SEQUENCE,
+  MOUSE_ENABLE_SEQUENCE,
+  type ModelSetupController,
+  type SlashCommandController,
+  wrapStdinForMouse,
+} from "@nanocode/tui";
 import { render } from "ink";
 // Explicit React import: proven necessary by direct A/B testing (removing it reproduces
 // "ReferenceError: React is not defined" here even though packages/cli already has its own
@@ -59,6 +66,45 @@ const PACKAGE_JSON_PATH = fileURLToPath(new URL("../package.json", import.meta.u
 const { version: PACKAGE_VERSION } = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8")) as {
   version: string;
 };
+
+/** Tracks whether the alternate screen buffer is currently active, so `exitFullscreen` (called from
+ * both the normal `finally` path in `main()` AND the `process.on("exit", ...)` safety net below)
+ * never writes the leave-sequence twice, and `enterFullscreen` never enters twice either. A module-
+ * level flag, not component state -- this has to survive and be reachable from a plain `process`
+ * event handler, entirely outside Ink/React's own lifecycle. */
+let fullscreenActive = false;
+
+function enterFullscreen(): void {
+  // No-op for piped/redirected output (matching every other TTY-gated behavior in this rendering
+  // path, e.g. Ink's own `isFullscreen` detection) -- there is no "screen" to take over, and
+  // writing raw terminal escape sequences into a non-TTY stream would just corrupt whatever is
+  // reading it.
+  if (!process.stdout.isTTY || fullscreenActive) return;
+  // Mouse reporting enabled in the SAME write as the alt-screen entry (see mouse.ts's own comment
+  // on why: a scroll wheel does nothing useful against the alt-screen's own, nonexistent scrollback,
+  // so nanocode has to capture and act on wheel events itself instead, the same way vim/less/htop --
+  // and, per the user's own explicit ask, Claude Code -- already do).
+  process.stdout.write(`\x1b[?1049h${MOUSE_ENABLE_SEQUENCE}`);
+  fullscreenActive = true;
+}
+
+function exitFullscreen(): void {
+  if (!fullscreenActive) return;
+  // Mouse reporting disabled BEFORE leaving the alt screen -- otherwise the user's real terminal
+  // keeps intercepting scroll/clicks for mouse reporting after nanocode exits, breaking normal text
+  // selection and scrollback in their shell.
+  process.stdout.write(`${MOUSE_DISABLE_SEQUENCE}\x1b[?1049l`);
+  fullscreenActive = false;
+}
+
+// Belt-and-suspenders safety net: `process.on("exit", ...)` handlers run synchronously even when
+// the process is exiting because of an uncaught exception or an explicit `process.exit()` call
+// that bypasses `main()`'s own `try`/`finally` below entirely -- without this, a crash while
+// fullscreen was active would leave the user's real terminal stuck showing nanocode's last frame
+// with no way back to their own shell except manually sending the escape sequence themselves.
+// (A hard `SIGKILL` can still bypass even this, same as any other cleanup handler anywhere --
+// nothing in Node can intercept that one, by design.)
+process.on("exit", exitFullscreen);
 
 async function main(): Promise<void> {
   // Trust gating is unchanged by onboarding: it still runs before anything else, as a plain
@@ -150,6 +196,23 @@ async function main(): Promise<void> {
     exportTranscript,
   };
 
+  // Real alternate-screen-buffer fullscreen mode (matching Claude Code's own separate "fullscreen
+  // renderer," confirmed as a genuinely distinct feature by inspecting its installed binary, not
+  // something invented for nanocode) -- superseding an earlier, narrower fix here that only
+  // cleared the visible screen before rendering. That fix addressed the SAME root problem this one
+  // does more completely: Ink starts rendering from wherever the cursor already sits, which is
+  // never actually the terminal's top-left in a real shell (the prompt line, the typed launch
+  // command, etc. already used some rows) -- filling a full-height layout from there overflowed
+  // the visible screen and scrolled the banner off the top. Entering the alternate screen buffer
+  // (`\x1b[?1049h`, the same escape sequence vim/htop/less use) hands the WHOLE terminal a fresh,
+  // separate, guaranteed-blank buffer to render into regardless of what was on the main buffer
+  // beforehand, so there is no "how many rows were already used" question left to get wrong.
+  // Leaving it (`\x1b[?1049l`) restores the user's original screen and scrollback completely
+  // untouched, as if nanocode was never there. `enterFullscreen`/`exitFullscreen` are idempotent
+  // and guarded by `fullscreenActive` so an unexpected double-call (e.g. the `finally` block below
+  // AND the `process.on("exit", ...)` safety net both firing) never double-writes either sequence.
+  enterFullscreen();
+
   // Passed straight through -- runShellCommand/editViaExternalEditor/readClipboard*/readDroppedFile
   // are all plain host functions with no `runtime`/session state of their own to close over (an
   // earlier version of runShellCommand routed bang commands through the kernel instead and needed
@@ -160,6 +223,12 @@ async function main(): Promise<void> {
   // already empty), so Ink's own default instant-exit-on-ctrl+c must be disabled here or it would
   // race app.tsx's handler and always win (Ink's own internal handling runs before any `useInput`
   // callback ever sees the keystroke).
+  // Wrapping stdin to strip/act on mouse-wheel byte sequences only makes sense against a real TTY
+  // (mouse.ts's own proxy calls `setRawMode`/`ref`/`unref`, which a piped/redirected stdin doesn't
+  // have) -- a non-TTY stdin is passed through to Ink untouched, exactly like before this feature.
+  const stdin = process.stdin.isTTY
+    ? (wrapStdinForMouse(process.stdin) as unknown as NodeJS.ReadStream)
+    : process.stdin;
   const { waitUntilExit } = render(
     <App
       session={initialSession}
@@ -173,11 +242,16 @@ async function main(): Promise<void> {
       readClipboardText={readClipboardText}
       readDroppedFile={readDroppedFile}
     />,
-    { exitOnCtrlC: false },
+    { exitOnCtrlC: false, stdin },
   );
   try {
     await waitUntilExit();
   } finally {
+    // Leave the alternate screen FIRST, before any cleanup work below -- restores the user's real
+    // terminal immediately on exit rather than leaving them staring at nanocode's last frame while
+    // runtime teardown (which can take a moment, e.g. a Docker-sandboxed kernel shutting down)
+    // still runs in the background.
+    exitFullscreen();
     if (pendingFinish) {
       // A rejected finish() (e.g. a bad model id) already means no runtime was ever built --
       // nothing to clean up, so swallow the rejection here rather than letting it mask whatever
